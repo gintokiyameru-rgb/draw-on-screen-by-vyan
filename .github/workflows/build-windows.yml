@@ -1,0 +1,70 @@
+name: Build VyanHQ Draw for Windows x64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout VyanHQ Draw
+        uses: actions/checkout@v4
+
+      - name: Clone official OBS plugin template
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git obs-template
+
+      - name: Overlay VyanHQ project on official template
+        shell: pwsh
+        run: |
+          Copy-Item "$env:GITHUB_WORKSPACE\src\plugin-main.cpp" "$env:GITHUB_WORKSPACE\obs-template\src\plugin-main.cpp" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\CMakeLists.txt" "$env:GITHUB_WORKSPACE\obs-template\CMakeLists.txt" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\buildspec.json" "$env:GITHUB_WORKSPACE\obs-template\buildspec.json" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" "$env:GITHUB_WORKSPACE\obs-template\data\locale\en-US.ini" -Force
+
+      - name: Download OBS 32.2.2 source and inject checksum
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          New-Item -ItemType Directory -Force .deps | Out-Null
+
+          $url = 'https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip'
+          $dst = '.deps/32.2.2.zip'
+
+          Invoke-WebRequest -Uri $url -OutFile $dst
+
+          $hash = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "OBS 32.2.2 source SHA256: $hash"
+
+          $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
+          $spec.dependencies.'obs-studio'.hashes.'windows-x64' = $hash
+
+          $spec | ConvertTo-Json -Depth 20 |
+            Set-Content buildspec.json -Encoding UTF8
+
+      - name: Configure
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          cmake --preset windows-x64
+
+      - name: Build
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          cmake --build --preset windows-x64 --config Release
+
+      - name: Package
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          $env:CI = 'true'
+          pwsh -NoProfile -File .github/scripts/Package-Windows.ps1 -Target x64 -Configuration Release
+
+      - name: Upload plugin package
+        uses: actions/upload-artifact@v4
+        with:
+          name: VyanHQ-Draw-OBS-Windows-x64
+          path: obs-template/release/*windows-x64*.zip
