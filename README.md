@@ -10,3 +10,7 @@ Key fixes:
 - Uses `actions/upload-artifact@v6`.
 
 The `web/` and `worker/` directories may stay in the same GitHub repository; they are not compiled into the OBS DLL unless explicitly referenced by the build.
+
+
+## v1.10 build fix
+This revision fixes the PowerShell duplicate `email` member error by assigning the existing property, and patches the official OBS template presets in a JSON-aware way. It also computes the OBS 32.2.2 source hash before invoking the official Windows build script.
