@@ -1,0 +1,79 @@
+name: Build VyanHQ Draw for Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout VyanHQ Draw
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Clone official OBS plugin template
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git obs-template
+
+      - name: Overlay VyanHQ project on official template
+        shell: pwsh
+        run: |
+          Copy-Item "$env:GITHUB_WORKSPACE\src\plugin-main.cpp" "$env:GITHUB_WORKSPACE\obs-template\src\plugin-main.cpp" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\CMakeLists.txt" "$env:GITHUB_WORKSPACE\obs-template\CMakeLists.txt" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\buildspec.json" "$env:GITHUB_WORKSPACE\obs-template\buildspec.json" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" "$env:GITHUB_WORKSPACE\obs-template\data\locale\en-US.ini" -Force
+
+      - name: Configure plugin build options
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          $presets = Get-Content CMakePresets.json -Raw | ConvertFrom-Json
+          foreach ($preset in $presets.configurePresets) {
+            if ($preset.name -eq 'template') {
+              $preset.cacheVariables.ENABLE_FRONTEND_API = $true
+              $preset.cacheVariables.ENABLE_QT = $true
+            }
+          }
+          $presets | ConvertTo-Json -Depth 20 | Set-Content CMakePresets.json -Encoding UTF8
+
+      - name: Set OBS 32.2.2 source checksum
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          $url = 'https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip'
+          $dst = '.deps/32.2.2.zip'
+          New-Item -ItemType Directory -Force .deps | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $dst
+          $hash = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "OBS 32.2.2 source SHA256: $hash"
+          $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
+          $spec.dependencies.'obs-studio'.hashes.'windows-x64' = $hash
+          $spec | ConvertTo-Json -Depth 20 | Set-Content buildspec.json -Encoding UTF8
+
+      - name: Build plugin
+        shell: pwsh
+        working-directory: obs-template
+        env:
+          CI: 'true'
+        run: |
+          .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+
+      - name: Package plugin
+        shell: pwsh
+        working-directory: obs-template
+        env:
+          CI: 'true'
+        run: |
+          .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+
+      - name: Upload plugin package
+        uses: actions/upload-artifact@v4
+        with:
+          name: VyanHQ-Draw-OBS-Windows-x64
+          path: obs-template/release/*windows-x64*.*
+          if-no-files-found: error
