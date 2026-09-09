@@ -16,6 +16,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QDockWidget>
+#include <QMainWindow>
 #include <QFormLayout>
 #include <QDesktopServices>
 #include <QUrlQuery>
@@ -205,18 +206,19 @@ private:
     QSettings settings;
 };
 
-static void hk_clear(void *, obs_hotkey_id, bool pressed) {
+static void hk_clear(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed) {
     if (pressed && g_ui) g_ui->doControlFromHotkey("clear");
 }
-static void hk_lock(void *, obs_hotkey_id, bool pressed) {
+static void hk_lock(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed) {
     if (pressed && g_ui) g_ui->doControlFromHotkey("lock");
 }
-static void hk_unlock(void *, obs_hotkey_id, bool pressed) {
+static void hk_unlock(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed) {
     if (pressed && g_ui) g_ui->doControlFromHotkey("unlock");
 }
 
 extern "C" bool obs_module_load(void) {
-    g_dock = new QDockWidget("VyanHQ Draw", obs_frontend_get_main_window());
+    auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+    g_dock = new QDockWidget(QStringLiteral("VyanHQ Draw"), mainWindow);
     g_dock->setObjectName("VyanHQDrawDock");
     g_ui = new VyanDock(g_dock);
     g_dock->setWidget(g_ui);
