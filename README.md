@@ -1,7 +1,12 @@
-# VyanHQ Draw v1.7
+# VyanHQ Draw v1.8 — Full Auto + Windows Build Fix
 
-Windows build workflow for OBS Studio 32.2.2 x64.
+This package combines the working OBS 32.2.2 build configuration from v1.5 with the v1.6 full-automatic OBS UI/source.
 
-This revision fixes the CI invocation to use the official OBS template's
-`.github/scripts/Build-Windows.ps1` instead of a root `build.ps1` that does not
-exist in the cloned template. Artifact upload uses `actions/upload-artifact@v6`.
+Key fixes:
+- Restores the complete `buildspec.json` required by the current OBS plugin template (`dependencies`, `email`, `platformConfig`).
+- Keeps OBS 32.2.2 / Windows x64 dependency versions.
+- Enables OBS Frontend API and Qt during CI build.
+- Uses the official OBS Windows build script.
+- Uses `actions/upload-artifact@v6`.
+
+The `web/` and `worker/` directories may stay in the same GitHub repository; they are not compiled into the OBS DLL unless explicitly referenced by the build.

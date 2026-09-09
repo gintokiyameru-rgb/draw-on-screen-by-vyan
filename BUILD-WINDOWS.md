@@ -1,8 +1,5 @@
 # Windows build
 
-The GitHub Actions workflow runs on `windows-2022`, clones the official OBS
-plugin template, injects the VyanHQ plugin sources, patches the template for
-OBS Studio 32.2.2 and then calls the template's official
-`.github/scripts/Build-Windows.ps1` script.
+This repository expects a GitHub Actions build on `windows-2022`. The workflow builds the native OBS plugin for x64 and uploads a packaged artifact.
 
-The resulting Windows x64 package is uploaded as a GitHub Actions artifact.
+For local building, use Visual Studio 2022 with Desktop development with C++, CMake, Windows SDK, and an OBS 32.2.2-compatible build environment.
