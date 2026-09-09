@@ -1,11 +1,8 @@
-# Windows build options
+# Windows build
 
-## Recommended: GitHub Actions
+The GitHub Actions workflow runs on `windows-2022`, clones the official OBS
+plugin template, injects the VyanHQ plugin sources, patches the template for
+OBS Studio 32.2.2 and then calls the template's official
+`.github/scripts/Build-Windows.ps1` script.
 
-Use the included `.github/workflows/build-windows.yml`. The workflow clones the official OBS plugin template, overlays this plugin, downloads OBS 32.2.2 sources, calculates the source archive SHA256 on the Windows runner, configures CMake, builds, packages, and uploads the resulting Windows x64 plugin ZIP.
-
-This is preferable to manually reconstructing the OBS SDK because the official template supplies the CMake helper modules and packaging scripts required by OBS plugins.
-
-## Local build
-
-On Windows 11, install Visual Studio 2022 with Desktop development with C++, CMake 3.30+, and Git. Clone the official OBS plugin template, then copy this project's `src/plugin-main.cpp`, `CMakeLists.txt`, `buildspec.json`, and locale file into the template before running the template's Windows build script/presets.
+The resulting Windows x64 package is uploaded as a GitHub Actions artifact.
