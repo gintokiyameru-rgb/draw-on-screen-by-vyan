@@ -31,27 +31,51 @@ jobs:
         run: |
           $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
 
-          if (-not $spec.email) {
-            $spec | Add-Member -NotePropertyName email -NotePropertyValue "vyanhq@example.invalid"
-          }
+          # Set existing scalar properties instead of Add-Member. This works
+          # whether the template already contains an empty email property.
+          $spec.email = "vyanhq@example.invalid"
 
           if (-not $spec.platformConfig) {
             $spec | Add-Member -NotePropertyName platformConfig -NotePropertyValue ([pscustomobject]@{})
           }
 
           if (-not $spec.platformConfig.macos) {
-            $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{
-              bundleId = "com.vyanhq.vyanhq-draw"
-            })
+            $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{})
+          }
+          $spec.platformConfig.macos.bundleId = "com.vyanhq.vyanhq-draw"
+
+          # Fix the OBS 32.2.2 source hash for the dependency resolver.
+          $obsUrl = "https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip"
+          $obsZip = Join-Path $env:GITHUB_WORKSPACE "obs-32.2.2.zip"
+          Invoke-WebRequest -Uri $obsUrl -OutFile $obsZip
+          $obsHash = (Get-FileHash $obsZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $spec.dependencies.'obs-studio'.hashes.'windows-x64' = $obsHash
+          Remove-Item $obsZip -Force
+
+          $spec | ConvertTo-Json -Depth 50 | Set-Content buildspec.json -Encoding UTF8
+
+          # Enable Qt + OBS frontend API in every preset object that defines cacheVariables.
+          $presets = Get-Content CMakePresets.json -Raw | ConvertFrom-Json
+
+          function Patch-Preset($node) {
+            if ($null -eq $node) { return }
+            if ($node.PSObject.Properties.Name -contains 'cacheVariables') {
+              if (-not $node.cacheVariables) {
+                $node.cacheVariables = [pscustomobject]@{}
+              }
+              $node.cacheVariables.ENABLE_FRONTEND_API = 'ON'
+              $node.cacheVariables.ENABLE_QT = 'ON'
+            }
+            if ($node.PSObject.Properties.Name -contains 'configurePresets') {
+              foreach ($p in $node.configurePresets) { Patch-Preset $p }
+            }
+            if ($node.PSObject.Properties.Name -contains 'buildPresets') {
+              foreach ($p in $node.buildPresets) { Patch-Preset $p }
+            }
           }
 
-          $spec | ConvertTo-Json -Depth 30 | Set-Content buildspec.json -Encoding UTF8
-
-          # Enable Qt/frontend API in the template presets used by VyanHQ.
-          $preset = Get-Content CMakePresets.json -Raw
-          $preset = $preset -replace '"ENABLE_FRONTEND_API"\s*:\s*"(OFF|FALSE)"', '"ENABLE_FRONTEND_API": "ON"'
-          $preset = $preset -replace '"ENABLE_QT"\s*:\s*"(OFF|FALSE)"', '"ENABLE_QT": "ON"'
-          Set-Content CMakePresets.json $preset -Encoding UTF8
+          Patch-Preset $presets
+          $presets | ConvertTo-Json -Depth 50 | Set-Content CMakePresets.json -Encoding UTF8
 
       - name: Build with official OBS Windows build script
         shell: pwsh
