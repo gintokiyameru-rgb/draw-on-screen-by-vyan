@@ -33,5 +33,6 @@
   "version": "1.1.0",
   "author": "VyanHQ",
   "website": "https://vyanhq.com",
-  "email": ""
+  "email": "",
+  "platformConfig": {}
 }
