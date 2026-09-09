@@ -1,0 +1,54 @@
+name: Build VyanHQ Draw for Windows x64
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+      - name: Clone official OBS plugin template
+        shell: pwsh
+        run: git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git obs-template
+      - name: Copy VyanHQ files into template
+        shell: pwsh
+        run: |
+          Copy-Item "$env:GITHUB_WORKSPACE\src\plugin-main.cpp" "$env:GITHUB_WORKSPACE\obs-template\src\plugin-main.cpp" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\CMakeLists.txt" "$env:GITHUB_WORKSPACE\obs-template\CMakeLists.txt" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\buildspec.json" "$env:GITHUB_WORKSPACE\obs-template\buildspec.json" -Force
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\obs-template\data\locale" | Out-Null
+          Copy-Item "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" "$env:GITHUB_WORKSPACE\obs-template\data\locale\en-US.ini" -Force
+      - name: Patch template for OBS 32.2.2 and VyanHQ
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          $spec=Get-Content buildspec.json -Raw | ConvertFrom-Json
+          if (-not $spec.platformConfig.macos) { $spec.platformConfig | Add-Member NoteProperty macos ([pscustomobject]@{bundleId='com.vyanhq.vyanhq-draw'}) }
+          $spec | ConvertTo-Json -Depth 20 | Set-Content buildspec.json -Encoding UTF8
+          $preset=Get-Content CMakePresets.json -Raw
+          $preset=$preset -replace '"ENABLE_FRONTEND_API"\s*:\s*"OFF"','"ENABLE_FRONTEND_API": "ON"'
+          $preset=$preset -replace '"ENABLE_QT"\s*:\s*"OFF"','"ENABLE_QT": "ON"'
+          Set-Content CMakePresets.json $preset
+          $date='2026-07-15'
+          $url="https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip"
+          New-Item -ItemType Directory -Force .deps | Out-Null
+          Invoke-WebRequest $url -OutFile .deps/obs-32.2.2.zip
+          $hash=(Get-FileHash .deps/obs-32.2.2.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "OBS 32.2.2 hash: $hash"
+          if (Test-Path .deps/obs-studio.zip) { Remove-Item .deps/obs-studio.zip -Force }
+          Copy-Item .deps/obs-32.2.2.zip .deps/obs-studio.zip
+      - name: Build
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          ./build.ps1 --target windows-x64 --config RelWithDebInfo
+      - name: Package plugin
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          $env:CI='true'
+          if (Test-Path '.github/scripts/Package-Windows.ps1') { pwsh -NoProfile -File .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo }
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VyanHQ-Draw-OBS-Windows-x64
+          path: obs-template/release/**
