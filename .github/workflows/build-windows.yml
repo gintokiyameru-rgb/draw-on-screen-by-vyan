@@ -40,7 +40,7 @@ jobs:
         shell: pwsh
         working-directory: obs-template
         run: |
-          ./build.ps1 --target windows-x64 --config RelWithDebInfo
+          ./.github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
       - name: Package plugin
         shell: pwsh
         working-directory: obs-template
@@ -48,7 +48,7 @@ jobs:
           $env:CI='true'
           if (Test-Path '.github/scripts/Package-Windows.ps1') { pwsh -NoProfile -File .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo }
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: VyanHQ-Draw-OBS-Windows-x64
           path: obs-template/release/**
