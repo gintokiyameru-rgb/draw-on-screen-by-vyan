@@ -40,7 +40,7 @@ jobs:
         shell: pwsh
         working-directory: obs-template
         run: |
-          ./.github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+          ./build.ps1 --target windows-x64 --config RelWithDebInfo
       - name: Package plugin
         shell: pwsh
         working-directory: obs-template
