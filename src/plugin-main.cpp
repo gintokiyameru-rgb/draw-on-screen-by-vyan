@@ -266,9 +266,14 @@ private:
     }
 
     bool createOrUseCanvas() {
-        if (!backendConfigured()) return false;
-        if (!canvasId.isEmpty() && !hostCanvasToken.isEmpty()) return true;
+        // DRAW is intentionally independent from CONNECT/member room.
+        // If a private canvas already exists, we only need the backend to open it.
+        if (!canvasId.isEmpty() && !hostCanvasToken.isEmpty()) {
+            return backendConfigured();
+        }
 
+        // Show the canvas creation dialog FIRST. Backend setup must not
+        // appear before the user has explicitly chosen to create a canvas.
         QDialog dlg(this);
         dlg.setWindowTitle("Create Canvas");
         auto *layout = new QVBoxLayout(&dlg);
@@ -276,12 +281,15 @@ private:
         auto *name = new QLineEdit(canvasName);
         name->setPlaceholderText("VyanHQ Draw");
         layout->addWidget(name);
-        auto *hint = new QLabel("Creates a private host canvas. Members are not required.");
+        auto *hint = new QLabel("Creates a private host canvas for your stream. This does not create or require a member room.");
         hint->setStyleSheet("color:#888;font-size:10px;"); hint->setWordWrap(true); layout->addWidget(hint);
         auto *buttons = new QHBoxLayout(); auto *cancel = new QPushButton("Cancel"); auto *accept = new QPushButton("Create"); buttons->addWidget(cancel); buttons->addWidget(accept); layout->addLayout(buttons);
         connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
         connect(accept, &QPushButton::clicked, &dlg, [&]() {
             QString n=name->text().trimmed(); if(n.isEmpty()) n="VyanHQ Draw";
+            // Only now, after the user explicitly accepted canvas creation,
+            // request the one-time Cloudflare Worker configuration if needed.
+            if (!backendConfigured()) return;
             QNetworkRequest req(QUrl(backend()+"/api/canvas/new")); req.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
             auto *reply=net.post(req,QJsonDocument(QJsonObject{{"name",n}}).toJson(QJsonDocument::Compact));
             connect(reply,&QNetworkReply::finished,this,[this,reply,&dlg,n](){
@@ -357,19 +365,19 @@ static void hk_toggle(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed) { if(
 extern "C" bool obs_module_load(void) {
     auto *mainWindow=static_cast<QMainWindow *>(obs_frontend_get_main_window());
     g_dock=new QDockWidget(QStringLiteral("VyanHQ Draw"),mainWindow);
-    g_dock->setObjectName(QStringLiteral("VyanHQDrawDockCompactV14"));
+    g_dock->setObjectName(QStringLiteral("VyanHQDrawDockCompactV15"));
     g_dock->setAllowedAreas(Qt::LeftDockWidgetArea|Qt::RightDockWidgetArea|Qt::TopDockWidgetArea|Qt::BottomDockWidgetArea);
     g_dock->resize(300,220);
     g_dock->setMinimumSize(170,150);
     g_dock->setFeatures(QDockWidget::DockWidgetMovable|QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetClosable);
     g_ui=new VyanDock(g_dock); g_dock->setWidget(g_ui);
-    obs_frontend_add_dock_by_id("vyanhq-draw-dock-v14","VyanHQ Draw",g_dock);
+    obs_frontend_add_dock_by_id("vyanhq-draw-dock-v15","VyanHQ Draw",g_dock);
 
     g_clear=obs_hotkey_register_frontend("vyanhq_draw_clear_members","VyanHQ Draw: Clear Member Drawings",hk_clear,nullptr);
     g_lock=obs_hotkey_register_frontend("vyanhq_draw_lock","VyanHQ Draw: Lock Member Drawing",hk_lock,nullptr);
     g_unlock=obs_hotkey_register_frontend("vyanhq_draw_unlock","VyanHQ Draw: Unlock Member Drawing",hk_unlock,nullptr);
     g_toggle=obs_hotkey_register_frontend("vyanhq_draw_toggle","VyanHQ Draw: Toggle Canvas",hk_toggle,nullptr);
-    blog(LOG_INFO,"VyanHQ Draw loaded (v1.14)");
+    blog(LOG_INFO,"VyanHQ Draw loaded (v1.15)");
     return true;
 }
 extern "C" void obs_module_unload(void){
@@ -377,7 +385,7 @@ extern "C" void obs_module_unload(void){
     if(g_lock!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_lock);
     if(g_unlock!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_unlock);
     if(g_toggle!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_toggle);
-    if(g_dock)obs_frontend_remove_dock("vyanhq-draw-dock-v14"); g_ui=nullptr; g_dock=nullptr;
+    if(g_dock)obs_frontend_remove_dock("vyanhq-draw-dock-v15"); g_ui=nullptr; g_dock=nullptr;
 }
 
 #include "plugin-main.moc"

@@ -1,6 +1,3 @@
-# Build
+# Build VyanHQ Draw v1.15
 
-Upload this project's contents to the root of your GitHub repository, then run:
-Actions -> Build VyanHQ Draw for Windows x64 -> Run workflow.
-
-The workflow targets OBS Studio 32.2.2 / Windows x64 and enables OBS frontend API + Qt.
+Use the same GitHub Actions workflow proven by v1.11. Replace `src/plugin-main.cpp` with this version and rebuild the Windows x64 artifact.
