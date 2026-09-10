@@ -5,6 +5,14 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QColorDialog>
+#include <QInputDialog>
+#include <QKeyEvent>
+#include <QToolButton>
+#include <QStatusBar>
+#include <vector>
+#include <algorithm>
+#include <cmath>
 #include <QDialog>
 #include <QDockWidget>
 #include <QHBoxLayout>
@@ -50,12 +58,17 @@ static bool g_canvasVisible = true;
 static bool g_memberLocked = false;
 static int g_brushSize = 8;
 static int g_eraserSize = 32;
+static QColor g_penColor(255, 255, 255, 255);
 static bool g_eraser = false;
 static QPoint g_lastPoint;
+static QPoint g_shapeStart;
 static bool g_drawing = false;
 static gs_texture_t *g_localTexture = nullptr;
 static uint64_t g_uploadedRevision = 0;
 static obs_source_info g_localSourceInfo{};
+
+enum class HostTool { Pen, Eraser, Line, Rectangle, Ellipse, Arrow, Text };
+static HostTool g_hostTool = HostTool::Pen;
 
 static void clearPrivateCanvas()
 {
@@ -64,23 +77,73 @@ static void clearPrivateCanvas()
     ++g_canvasRevision;
 }
 
-static void drawSegment(const QPoint &a, const QPoint &b)
+static void pushCanvasSnapshot(std::vector<QImage> &undo, std::vector<QImage> &redo)
+{
+    QMutexLocker lock(&g_canvasMutex);
+    undo.push_back(g_canvas);
+    if (undo.size() > 50) undo.erase(undo.begin());
+    redo.clear();
+}
+
+static void restoreCanvasFrom(QImage img)
+{
+    QMutexLocker lock(&g_canvasMutex);
+    g_canvas = std::move(img);
+    ++g_canvasRevision;
+}
+
+static QPoint mapToCanvasPoint(const QWidget *w, const QPoint &p)
+{
+    const double sx = 1920.0 / qMax(1, w->width());
+    const double sy = 1080.0 / qMax(1, w->height());
+    return QPoint(qBound(0, qRound(p.x() * sx), 1919), qBound(0, qRound(p.y() * sy), 1079));
+}
+
+static void drawLineOnCanvas(const QPoint &a, const QPoint &b, const QPen &pen,
+                             QPainter::CompositionMode mode = QPainter::CompositionMode_SourceOver)
 {
     QMutexLocker lock(&g_canvasMutex);
     QPainter p(&g_canvas);
     p.setRenderHint(QPainter::Antialiasing, true);
-    if (g_eraser) {
-        p.setCompositionMode(QPainter::CompositionMode_Clear);
-        p.setPen(QPen(Qt::transparent, g_eraserSize, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    } else {
-        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        p.setPen(QPen(QColor(255, 255, 255, 255), g_brushSize, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    }
+    p.setCompositionMode(mode);
+    p.setPen(pen);
     p.drawLine(a, b);
     ++g_canvasRevision;
 }
 
-static const char *localSourceGetName(void *, void *) { return "VyanHQ Draw"; }
+static void drawShapeOnCanvas(const QPoint &a, const QPoint &b, HostTool tool)
+{
+    QMutexLocker lock(&g_canvasMutex);
+    QPainter p(&g_canvas);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    QPen pen(g_penColor, g_brushSize, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+    const QRect r(QPoint(qMin(a.x(), b.x()), qMin(a.y(), b.y())),
+                  QPoint(qMax(a.x(), b.x()), qMax(a.y(), b.y())));
+    switch (tool) {
+    case HostTool::Line: p.drawLine(a, b); break;
+    case HostTool::Rectangle: p.drawRect(r); break;
+    case HostTool::Ellipse: p.drawEllipse(r); break;
+    case HostTool::Arrow: {
+        p.drawLine(a, b);
+        const QLineF line(a, b);
+        const double angle = std::atan2(-line.dy(), line.dx());
+        const double arrowSize = qMax(8, g_brushSize * 2);
+        QPointF p1 = line.p2() - QPointF(std::cos(angle + 3.14159265358979323846 / 6) * arrowSize,
+                                         -std::sin(angle + 3.14159265358979323846 / 6) * arrowSize);
+        QPointF p2 = line.p2() - QPointF(std::cos(angle - 3.14159265358979323846 / 6) * arrowSize,
+                                         -std::sin(angle - 3.14159265358979323846 / 6) * arrowSize);
+        p.drawLine(line.p2(), p1); p.drawLine(line.p2(), p2);
+        break;
+    }
+    default: break;
+    }
+    ++g_canvasRevision;
+}
+
+static const char *localSourceGetName(void *) { return "VyanHQ Draw"; }
 static void *localSourceCreate(obs_data_t *, obs_source_t *) { return nullptr; }
 static void localSourceDestroy(void *) {}
 static uint32_t localSourceWidth(void *) { return 1920; }
@@ -120,39 +183,89 @@ public:
     {
         setAttribute(Qt::WA_TranslucentBackground, true);
         setMouseTracking(true);
-        setMinimumSize(640, 360);
+        setMinimumSize(420, 280);
+        setCursor(Qt::CrossCursor);
     }
+
+    void setZoom(double z) { m_zoom = qBound(0.25, z, 2.5); updateGeometry(); update(); }
+    double zoom() const { return m_zoom; }
+    void setTool(HostTool tool) { m_tool = tool; setCursor(tool == HostTool::Text ? Qt::IBeamCursor : Qt::CrossCursor); }
+    HostTool tool() const { return m_tool; }
+    void setColor(const QColor &c) { g_penColor = c; }
+    void setStacks(std::vector<QImage> *u, std::vector<QImage> *r) { m_undo = u; m_redo = r; }
+
+    QSize sizeHint() const override { return QSize(qRound(960 * m_zoom), qRound(540 * m_zoom)); }
+
 protected:
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         QMutexLocker lock(&g_canvasMutex);
-        p.drawImage(rect(), g_canvas);
+        const QSize target(qRound(1920 * m_zoom), qRound(1080 * m_zoom));
+        QRect dst(QPoint(0,0), target);
+        p.drawImage(dst, g_canvas);
     }
+
     void mousePressEvent(QMouseEvent *e) override
     {
         if (e->button() != Qt::LeftButton || g_memberLocked) return;
+        const QPoint p = mapToCanvasPointScaled(e->position().toPoint());
+        if (m_tool == HostTool::Text) {
+            bool ok = false;
+            const QString text = QInputDialog::getText(this, "Insert Text", "Text:", QLineEdit::Normal, QString(), &ok);
+            if (ok && !text.isEmpty()) {
+                if (m_undo) pushCanvasSnapshot(*m_undo, *m_redo);
+                QMutexLocker lock(&g_canvasMutex);
+                QPainter painter(&g_canvas); painter.setRenderHint(QPainter::TextAntialiasing, true);
+                QFont f; f.setPointSize(qMax(8, g_brushSize * 2)); painter.setFont(f); painter.setPen(g_penColor);
+                painter.drawText(p, text); ++g_canvasRevision;
+                update();
+            }
+            return;
+        }
+        if (m_undo) pushCanvasSnapshot(*m_undo, *m_redo);
         g_drawing = true;
-        g_lastPoint = mapToCanvas(e->position().toPoint());
-        drawSegment(g_lastPoint, g_lastPoint);
-        update();
+        g_lastPoint = p;
+        g_shapeStart = p;
+        if (m_tool == HostTool::Pen || m_tool == HostTool::Eraser) {
+            QPen pen(m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
+                     m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
+                     Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+            drawLineOnCanvas(p, p, pen, m_tool == HostTool::Eraser ? QPainter::CompositionMode_Clear : QPainter::CompositionMode_SourceOver);
+            update();
+        }
     }
+
     void mouseMoveEvent(QMouseEvent *e) override
     {
         if (!g_drawing || g_memberLocked) return;
-        const QPoint p = mapToCanvas(e->position().toPoint());
-        drawSegment(g_lastPoint, p);
-        g_lastPoint = p;
-        update();
+        const QPoint p = mapToCanvasPointScaled(e->position().toPoint());
+        if (m_tool == HostTool::Pen || m_tool == HostTool::Eraser) {
+            QPen pen(m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
+                     m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
+                     Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+            drawLineOnCanvas(g_lastPoint, p, pen, m_tool == HostTool::Eraser ? QPainter::CompositionMode_Clear : QPainter::CompositionMode_SourceOver);
+            g_lastPoint = p; update();
+        }
     }
+
     void mouseReleaseEvent(QMouseEvent *e) override
     {
-        if (e->button() == Qt::LeftButton) g_drawing = false;
+        if (e->button() != Qt::LeftButton || !g_drawing) return;
+        const QPoint p = mapToCanvasPointScaled(e->position().toPoint());
+        if (m_tool != HostTool::Pen && m_tool != HostTool::Eraser) {
+            drawShapeOnCanvas(g_shapeStart, p, m_tool);
+        }
+        g_drawing = false; update();
     }
+
 private:
-    QPoint mapToCanvas(const QPoint &p) const
-    {
+    HostTool m_tool = HostTool::Pen;
+    double m_zoom = 1.0;
+    std::vector<QImage> *m_undo = nullptr;
+    std::vector<QImage> *m_redo = nullptr;
+    QPoint mapToCanvasPointScaled(const QPoint &p) const {
         const double sx = 1920.0 / qMax(1, width());
         const double sy = 1080.0 / qMax(1, height());
         return QPoint(qBound(0, qRound(p.x() * sx), 1919), qBound(0, qRound(p.y() * sy), 1079));
@@ -165,28 +278,54 @@ public:
     explicit HostDrawDialog(QWidget *parent = nullptr) : QDialog(parent)
     {
         setWindowTitle("VyanHQ Draw — Private Canvas");
-        resize(980, 720);
+        resize(1100, 760);
         auto *root = new QVBoxLayout(this);
-        auto *bar = new QHBoxLayout();
-        auto *pen = new QPushButton("Pen");
-        auto *eraser = new QPushButton("Eraser");
-        auto *clear = new QPushButton("Clear");
-        auto *bl = new QLabel("Brush");
-        auto *bs = new QSlider(Qt::Horizontal); bs->setRange(1, 80); bs->setValue(g_brushSize);
-        auto *el = new QLabel("Eraser");
-        auto *es = new QSlider(Qt::Horizontal); es->setRange(4, 160); es->setValue(g_eraserSize);
-        bar->addWidget(pen); bar->addWidget(eraser); bar->addWidget(clear);
-        bar->addWidget(bl); bar->addWidget(bs, 1); bar->addWidget(el); bar->addWidget(es, 1);
-        root->addLayout(bar);
-        canvas = new LocalCanvasWidget(this); root->addWidget(canvas, 1);
-        connect(pen, &QPushButton::clicked, this, [] { g_eraser = false; });
-        connect(eraser, &QPushButton::clicked, this, [] { g_eraser = true; });
-        connect(clear, &QPushButton::clicked, this, [this] { clearPrivateCanvas(); canvas->update(); });
-        connect(bs, &QSlider::valueChanged, this, [](int v) { g_brushSize = v; });
-        connect(es, &QSlider::valueChanged, this, [](int v) { g_eraserSize = v; });
+        root->setContentsMargins(8,8,8,8);
+        root->setSpacing(6);
+        auto *toolbar = new QHBoxLayout();
+        addTool(toolbar, "Pen", HostTool::Pen);
+        addTool(toolbar, "Eraser", HostTool::Eraser);
+        addTool(toolbar, "Line", HostTool::Line);
+        addTool(toolbar, "Rect", HostTool::Rectangle);
+        addTool(toolbar, "Circle", HostTool::Ellipse);
+        addTool(toolbar, "Arrow", HostTool::Arrow);
+        addTool(toolbar, "Text", HostTool::Text);
+        auto *colorBtn = new QPushButton("Color"); toolbar->addWidget(colorBtn);
+        auto *brushLabel = new QLabel("Brush"); toolbar->addWidget(brushLabel);
+        auto *brush = new QSlider(Qt::Horizontal); brush->setRange(1,80); brush->setValue(g_brushSize); toolbar->addWidget(brush,2);
+        auto *eraseLabel = new QLabel("Eraser"); toolbar->addWidget(eraseLabel);
+        auto *eraser = new QSlider(Qt::Horizontal); eraser->setRange(4,160); eraser->setValue(g_eraserSize); toolbar->addWidget(eraser,2);
+        auto *undoBtn = new QPushButton("Undo"); auto *redoBtn = new QPushButton("Redo"); auto *clearBtn = new QPushButton("Clear");
+        toolbar->addWidget(undoBtn); toolbar->addWidget(redoBtn); toolbar->addWidget(clearBtn);
+        root->addLayout(toolbar);
+
+        auto *zoomRow = new QHBoxLayout();
+        zoomRow->addWidget(new QLabel("Zoom"));
+        zoom = new QSlider(Qt::Horizontal); zoom->setRange(25,250); zoom->setValue(100); zoomRow->addWidget(zoom,1);
+        zoomLabel = new QLabel("100%"); zoomRow->addWidget(zoomLabel);
+        root->addLayout(zoomRow);
+
+        canvas = new LocalCanvasWidget(this); canvas->setStacks(&undo, &redo);
+        root->addWidget(canvas,1);
+
+        connect(colorBtn,&QPushButton::clicked,this,[this]{ const QColor c=QColorDialog::getColor(g_penColor,this,"Choose drawing color"); if(c.isValid()){g_penColor=c;canvas->setColor(c);} });
+        connect(brush,&QSlider::valueChanged,this,[](int v){g_brushSize=v;});
+        connect(eraser,&QSlider::valueChanged,this,[](int v){g_eraserSize=v;});
+        connect(clearBtn,&QPushButton::clicked,this,[this]{ pushCanvasSnapshot(undo,redo); clearPrivateCanvas(); canvas->update(); });
+        connect(undoBtn,&QPushButton::clicked,this,[this]{ if(undo.empty())return; {QMutexLocker lock(&g_canvasMutex); redo.push_back(g_canvas);} restoreCanvasFrom(undo.back()); undo.pop_back(); canvas->update(); });
+        connect(redoBtn,&QPushButton::clicked,this,[this]{ if(redo.empty())return; {QMutexLocker lock(&g_canvasMutex); undo.push_back(g_canvas);} restoreCanvasFrom(redo.back()); redo.pop_back(); canvas->update(); });
+        connect(zoom,&QSlider::valueChanged,this,[this](int v){double z=v/100.0;zoomLabel->setText(QString::number(v)+"%");canvas->setZoom(z);});
     }
 private:
     LocalCanvasWidget *canvas = nullptr;
+    QSlider *zoom = nullptr;
+    QLabel *zoomLabel = nullptr;
+    std::vector<QImage> undo, redo;
+    void addTool(QHBoxLayout *bar, const QString &name, HostTool tool) {
+        auto *b = new QPushButton(name); b->setCheckable(true); b->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred); bar->addWidget(b);
+        if(tool==HostTool::Pen) b->setChecked(true);
+        connect(b,&QPushButton::clicked,this,[this,tool,b,bar]{ canvas->setTool(tool); for(auto *w: bar->parentWidget()->findChildren<QPushButton*>()){ if(w!=b && w->text()!=QChar(0)){} } });
+    }
 };
 
 static QString trimBase(QString s)
@@ -390,18 +529,18 @@ extern "C" bool obs_module_load(void)
 
     auto *mainWindow=static_cast<QMainWindow *>(obs_frontend_get_main_window());
     g_dock=new QDockWidget(QStringLiteral("VyanHQ Draw"),mainWindow);
-    g_dock->setObjectName(QStringLiteral("VyanHQDrawDockCompactV16"));
+    g_dock->setObjectName(QStringLiteral("VyanHQDrawDockCompactV18"));
     g_dock->setAllowedAreas(Qt::LeftDockWidgetArea|Qt::RightDockWidgetArea|Qt::TopDockWidgetArea|Qt::BottomDockWidgetArea);
     g_dock->resize(300,220);g_dock->setMinimumSize(170,140);
     g_dock->setFeatures(QDockWidget::DockWidgetMovable|QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetClosable);
-    g_ui=new VyanDock(g_dock);g_dock->setWidget(g_ui);obs_frontend_add_dock_by_id("vyanhq-draw-dock-v16","VyanHQ Draw",g_dock);
+    g_ui=new VyanDock(g_dock);g_dock->setWidget(g_ui);obs_frontend_add_dock_by_id("vyanhq-draw-dock-v18","VyanHQ Draw",g_dock);
 
     g_clearMembers=obs_hotkey_register_frontend("vyanhq_draw_clear_members","VyanHQ Draw: Clear Member Drawings",hkClearMembers,nullptr);
     g_clearMine=obs_hotkey_register_frontend("vyanhq_draw_clear_mine","VyanHQ Draw: Clear My Canvas",hkClearMine,nullptr);
     g_lock=obs_hotkey_register_frontend("vyanhq_draw_lock","VyanHQ Draw: Lock Member Drawing",hkLock,nullptr);
     g_unlock=obs_hotkey_register_frontend("vyanhq_draw_unlock","VyanHQ Draw: Unlock Member Drawing",hkUnlock,nullptr);
     g_toggle=obs_hotkey_register_frontend("vyanhq_draw_toggle","VyanHQ Draw: Toggle Private Canvas",hkToggle,nullptr);
-    blog(LOG_INFO,"VyanHQ Draw loaded (v1.16)");
+    blog(LOG_INFO,"VyanHQ Draw loaded (v1.18)");
     return true;
 }
 
@@ -413,7 +552,7 @@ extern "C" void obs_module_unload(void)
     if(g_unlock!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_unlock);
     if(g_toggle!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_toggle);
     if(g_localTexture){obs_enter_graphics();gs_texture_destroy(g_localTexture);g_localTexture=nullptr;obs_leave_graphics();}
-    if(g_dock)obs_frontend_remove_dock("vyanhq-draw-dock-v16");
+    if(g_dock)obs_frontend_remove_dock("vyanhq-draw-dock-v18");
     g_ui=nullptr;g_dock=nullptr;
 }
 
