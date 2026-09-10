@@ -24,6 +24,9 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\buildspec.json" "$env:GITHUB_WORKSPACE\obs-template\buildspec.json" -Force
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\obs-template\data\locale" | Out-Null
           Copy-Item "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" "$env:GITHUB_WORKSPACE\obs-template\data\locale\en-US.ini" -Force
+          if (Test-Path "$env:GITHUB_WORKSPACE\data\locale\en-GB.ini") {
+            Copy-Item "$env:GITHUB_WORKSPACE\data\locale\en-GB.ini" "$env:GITHUB_WORKSPACE\obs-template\data\locale\en-GB.ini" -Force
+          }
 
       - name: Patch template for OBS 32.2.2 and VyanHQ
         shell: pwsh
