@@ -149,8 +149,10 @@ static void localSourceDestroy(void *) {}
 static uint32_t localSourceWidth(void *) { return 1920; }
 static uint32_t localSourceHeight(void *) { return 1080; }
 
-static void localSourceVideoRender(void *, gs_effect_t *)
+static void localSourceVideoRender(void *, gs_effect_t *effect)
 {
+    UNUSED_PARAMETER(effect);
+
     if (!g_canvasVisible)
         return;
 
@@ -163,20 +165,23 @@ static void localSourceVideoRender(void *, gs_effect_t *)
     }
 
     if (!g_localTexture)
-        g_localTexture = gs_texture_create(1920, 1080, GS_RGBA, 1, nullptr, GS_DYNAMIC);
+        g_localTexture = gs_texture_create(
+            1920, 1080, GS_RGBA, 1, nullptr, GS_DYNAMIC);
 
     if (g_localTexture && revision != g_uploadedRevision) {
-        gs_texture_set_image(g_localTexture, copy.constBits(), static_cast<uint32_t>(copy.bytesPerLine()), false);
+        gs_texture_set_image(
+            g_localTexture,
+            copy.constBits(),
+            static_cast<uint32_t>(copy.bytesPerLine()),
+            false);
         g_uploadedRevision = revision;
     }
 
     if (g_localTexture) {
-        gs_effect_t *drawEffect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-        if (!drawEffect)
-            return;
-
-        while (gs_effect_loop(drawEffect, "Draw"))
-            gs_draw_sprite(g_localTexture, 0, 1920, 1080);
+        // This is a standard synchronous video source. OBS documents that
+        // such sources should use obs_source_draw() when not using
+        // OBS_SOURCE_CUSTOM_DRAW. This also preserves the texture alpha.
+        obs_source_draw(g_localTexture, 0, 0, 1920, 1080, false);
     }
 }
 
@@ -430,6 +435,16 @@ private:
     }
 };
 
+static bool localCanvasSourceExists()
+{
+    obs_source_t *existing = obs_get_source_by_name("VyanHQ Draw");
+    if (!existing)
+        return false;
+
+    obs_source_release(existing);
+    return true;
+}
+
 static QString trimBase(QString s)
 {
     s = s.trimmed();
@@ -499,7 +514,7 @@ private:
         server=settings.value("server").toString();
         room=settings.value("room").toString(); roomName=settings.value("roomName").toString();
         hostToken=settings.value("hostToken").toString(); memberToken=settings.value("memberToken").toString();
-        canvasName=settings.value("canvasName").toString(); canvasExists=settings.value("canvasExists",false).toBool();
+        canvasName=settings.value("canvasName").toString(); canvasExists=localCanvasSourceExists();
         memberRoomActive=!room.isEmpty()&&!hostToken.isEmpty()&&!memberToken.isEmpty();
         refreshStatus();
     }
@@ -556,52 +571,197 @@ private:
     QString makeMemberOverlayUrl() const { QUrl u(backend()+"/overlay");QUrlQuery q;q.addQueryItem("room",room);q.addQueryItem("token",hostToken);q.addQueryItem("role","overlay");u.setQuery(q);return u.toString(); }
     void copyMemberLink(){ if(!memberRoomActive){QMessageBox::information(this,"VyanHQ Draw","Create a member room with Connect first.");return;}QApplication::clipboard()->setText(makeMemberUrl()); }
 
-    void drawClicked(){
-        if(!canvasExists){
-            QDialog dlg(this); dlg.setWindowTitle("Create Canvas"); auto *l=new QVBoxLayout(&dlg); l->addWidget(new QLabel("Canvas name"));
-            auto *e=new QLineEdit(canvasName); e->setPlaceholderText("VyanHQ Draw"); l->addWidget(e);
-            auto *hint=new QLabel("Private canvas for your own drawing. No Cloudflare or member room is required.");hint->setWordWrap(true);hint->setStyleSheet("color:#888;font-size:10px;");l->addWidget(hint);
-            auto *r=new QHBoxLayout();auto *c=new QPushButton("Cancel");auto *make=new QPushButton("Create");r->addWidget(c);r->addWidget(make);l->addLayout(r);
-            connect(c,&QPushButton::clicked,&dlg,&QDialog::reject);
-            connect(make,&QPushButton::clicked,&dlg,[this,&dlg,e](){canvasName=e->text().trimmed();if(canvasName.isEmpty())canvasName="VyanHQ Draw";canvasExists=true;settings.setValue("canvasName",canvasName);settings.setValue("canvasExists",true);createLocalObsSource();dlg.accept();});
+    void drawClicked()
+    {
+        // Use the actual OBS source as the source of truth. A stale saved
+        // boolean must never suppress the Create Canvas dialog.
+        canvasExists = localCanvasSourceExists();
+
+        if (!canvasExists) {
+            QDialog dlg(this);
+            dlg.setWindowTitle("Create Canvas");
+
+            auto *l = new QVBoxLayout(&dlg);
+            l->setContentsMargins(12, 12, 12, 12);
+            l->setSpacing(8);
+
+            l->addWidget(new QLabel("Canvas name"));
+
+            auto *e = new QLineEdit(canvasName);
+            e->setPlaceholderText("VyanHQ Draw");
+            e->setClearButtonEnabled(true);
+            l->addWidget(e);
+
+            auto *sizeInfo = new QLabel(
+                "OBS overlay size: 1920 × 1080");
+            sizeInfo->setStyleSheet("color:#8f8f9b;font-size:10px;");
+            l->addWidget(sizeInfo);
+
+            auto *hint = new QLabel(
+                "Private canvas for your own drawing. "
+                "No Cloudflare or member room is required.");
+            hint->setWordWrap(true);
+            hint->setStyleSheet("color:#8f8f9b;font-size:10px;");
+            l->addWidget(hint);
+
+            auto *r = new QHBoxLayout();
+            auto *c = new QPushButton("Cancel");
+            auto *make = new QPushButton("Create");
+            make->setDefault(true);
+            r->addStretch();
+            r->addWidget(c);
+            r->addWidget(make);
+            l->addLayout(r);
+
+            connect(c, &QPushButton::clicked, &dlg, &QDialog::reject);
+            connect(make, &QPushButton::clicked, &dlg,
+                    [this, &dlg, e]() {
+                        QString name = e->text().trimmed();
+                        if (name.isEmpty())
+                            name = "VyanHQ Draw";
+
+                        canvasName = name;
+                        settings.setValue("canvasName", canvasName);
+
+                        if (!createLocalObsSource()) {
+                            QMessageBox::warning(
+                                this, "VyanHQ Draw",
+                                "Could not create the VyanHQ Draw source "
+                                "in the active OBS scene.");
+                            return;
+                        }
+
+                        canvasExists = true;
+                        settings.setValue("canvasExists", true);
+                        dlg.accept();
+                    });
+
             dlg.exec();
+
+            if (!canvasExists)
+                return;
         }
-        if(canvasExists){ createLocalObsSource(); auto *host=new HostDrawDialog(this); host->setAttribute(Qt::WA_DeleteOnClose,true); host->show();host->raise();host->activateWindow();g_canvasVisible=true;setStatus("Canvas Active",true); }
+
+        if (createLocalObsSource()) {
+            auto *host = new HostDrawDialog(this);
+            host->setAttribute(Qt::WA_DeleteOnClose, true);
+            host->show();
+            host->raise();
+            host->activateWindow();
+            g_canvasVisible = true;
+            setStatus("Canvas Active", true);
+        }
     }
-    void createLocalObsSource(){
+
+    bool createLocalObsSource()
+    {
         const char *sourceName = "VyanHQ Draw";
         obs_source_t *existing = obs_get_source_by_name(sourceName);
+
         if (!existing) {
             obs_data_t *d = obs_data_create();
-            obs_source_t *src = obs_source_create("vyanhq_draw_local", sourceName, d, nullptr);
+            obs_source_t *src =
+                obs_source_create("vyanhq_draw_local", sourceName, d, nullptr);
             obs_data_release(d);
-            if (src) {
-                obs_source_set_enabled(src, true);
-                obs_source_t *current = obs_frontend_get_current_scene();
-                if (current) {
-                    obs_scene_t *scene = obs_scene_from_source(current);
-                    if (scene) {
-                        obs_sceneitem_t *item = obs_scene_add(scene, src);
+
+            if (!src)
+                return false;
+
+            obs_source_t *current = obs_frontend_get_current_scene();
+            if (!current) {
+                obs_source_release(src);
+                return false;
+            }
+
+            obs_scene_t *scene = obs_scene_from_source(current);
+            if (!scene) {
+                obs_source_release(current);
+                obs_source_release(src);
+                return false;
+            }
+
+            obs_sceneitem_t *item = obs_scene_add(scene, src);
+            if (!item) {
+                obs_source_release(current);
+                obs_source_release(src);
+                return false;
+            }
+
+            obs_sceneitem_set_visible(item, true);
+            obs_sceneitem_set_locked(item, false);
+
+            struct vec2 pos = {0.0f, 0.0f};
+            struct vec2 scale = {1.0f, 1.0f};
+            obs_sceneitem_set_pos(item, &pos);
+            obs_sceneitem_set_scale(item, &scale);
+            obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
+
+            obs_source_set_enabled(src, true);
+
+            obs_source_release(current);
+            obs_source_release(src);
+        } else {
+            obs_source_set_enabled(existing, true);
+
+            bool inCurrentScene = false;
+            obs_source_t *current = obs_frontend_get_current_scene();
+
+            if (current) {
+                obs_scene_t *scene = obs_scene_from_source(current);
+                if (scene) {
+                    struct FindCtx {
+                        obs_source_t *target;
+                        bool found;
+                    } ctx{existing, false};
+
+                    obs_scene_enum_items(
+                        scene,
+                        [](obs_scene_t *, obs_sceneitem_t *item, void *data) {
+                            auto *ctx = static_cast<FindCtx *>(data);
+                            if (obs_sceneitem_get_source(item) == ctx->target) {
+                                ctx->found = true;
+                                obs_sceneitem_set_visible(item, true);
+                                obs_sceneitem_set_locked(item, false);
+
+                                struct vec2 pos = {0.0f, 0.0f};
+                                struct vec2 scale = {1.0f, 1.0f};
+                                obs_sceneitem_set_pos(item, &pos);
+                                obs_sceneitem_set_scale(item, &scale);
+                                obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
+                                return false;
+                            }
+                            return true;
+                        },
+                        &ctx);
+
+                    inCurrentScene = ctx.found;
+                    if (!inCurrentScene) {
+                        obs_sceneitem_t *item = obs_scene_add(scene, existing);
                         if (item) {
                             obs_sceneitem_set_visible(item, true);
                             obs_sceneitem_set_locked(item, false);
+
                             struct vec2 pos = {0.0f, 0.0f};
-                            obs_sceneitem_set_pos(item, &pos);
                             struct vec2 scale = {1.0f, 1.0f};
+                            obs_sceneitem_set_pos(item, &pos);
                             obs_sceneitem_set_scale(item, &scale);
                             obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
+                            inCurrentScene = true;
                         }
                     }
-                    obs_source_release(current);
                 }
-                obs_source_release(src);
+                obs_source_release(current);
             }
-        } else {
-            obs_source_set_enabled(existing, true);
+
             obs_source_release(existing);
+            if (!inCurrentScene)
+                return false;
         }
+
         g_canvasVisible = true;
+        return true;
     }
+
     void createMemberOverlaySource(){
         if(!memberRoomActive)return;
         const QString url=makeMemberOverlayUrl();
@@ -663,7 +823,7 @@ extern "C" bool obs_module_load(void)
     g_lock=obs_hotkey_register_frontend("vyanhq_draw_lock","VyanHQ Draw: Lock Member Drawing",hkLock,nullptr);
     g_unlock=obs_hotkey_register_frontend("vyanhq_draw_unlock","VyanHQ Draw: Unlock Member Drawing",hkUnlock,nullptr);
     g_toggle=obs_hotkey_register_frontend("vyanhq_draw_toggle","VyanHQ Draw: Toggle Private Canvas",hkToggle,nullptr);
-    blog(LOG_INFO,"VyanHQ Draw loaded (v1.18)");
+    blog(LOG_INFO,"VyanHQ Draw loaded (v1.21)");
     return true;
 }
 
