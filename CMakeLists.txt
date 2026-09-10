@@ -34,3 +34,10 @@ endif()
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_20)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+
+# Explicitly package both English locales so OBS can resolve either en-US or en-GB.
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/data/locale/en-US.ini"
+  "${CMAKE_CURRENT_SOURCE_DIR}/data/locale/en-GB.ini"
+  DESTINATION "data/obs-plugins/${_name}/locale")

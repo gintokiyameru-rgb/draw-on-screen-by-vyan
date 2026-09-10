@@ -149,9 +149,9 @@ static void localSourceDestroy(void *) {}
 static uint32_t localSourceWidth(void *) { return 1920; }
 static uint32_t localSourceHeight(void *) { return 1080; }
 
-static void localSourceVideoRender(void *, gs_effect_t *effect)
+static void localSourceVideoRender(void *, gs_effect_t *)
 {
-    if (!effect || !g_canvasVisible)
+    if (!g_canvasVisible)
         return;
 
     QImage copy;
@@ -171,7 +171,11 @@ static void localSourceVideoRender(void *, gs_effect_t *effect)
     }
 
     if (g_localTexture) {
-        while (gs_effect_loop(effect, "Draw"))
+        gs_effect_t *drawEffect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+        if (!drawEffect)
+            return;
+
+        while (gs_effect_loop(drawEffect, "Draw"))
             gs_draw_sprite(g_localTexture, 0, 1920, 1080);
     }
 }
@@ -184,17 +188,36 @@ public:
         setAttribute(Qt::WA_TranslucentBackground, true);
         setMouseTracking(true);
         setMinimumSize(420, 280);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         setCursor(Qt::CrossCursor);
     }
 
-    void setZoom(double z) { m_zoom = qBound(0.25, z, 2.5); updateGeometry(); update(); }
+    void setZoom(double z)
+    {
+        m_zoom = qBound(0.25, z, 2.0);
+        update();
+    }
+
     double zoom() const { return m_zoom; }
-    void setTool(HostTool tool) { m_tool = tool; setCursor(tool == HostTool::Text ? Qt::IBeamCursor : Qt::CrossCursor); }
+
+    void setTool(HostTool tool)
+    {
+        m_tool = tool;
+        if (tool == HostTool::Text)
+            setCursor(Qt::IBeamCursor);
+        else
+            setCursor(Qt::CrossCursor);
+    }
+
     HostTool tool() const { return m_tool; }
     void setColor(const QColor &c) { g_penColor = c; }
-    void setStacks(std::vector<QImage> *u, std::vector<QImage> *r) { m_undo = u; m_redo = r; }
+    void setStacks(std::vector<QImage> *u, std::vector<QImage> *r)
+    {
+        m_undo = u;
+        m_redo = r;
+    }
 
-    QSize sizeHint() const override { return QSize(qRound(960 * m_zoom), qRound(540 * m_zoom)); }
+    QSize sizeHint() const override { return QSize(960, 540); }
 
 protected:
     void paintEvent(QPaintEvent *) override
@@ -202,62 +225,109 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         QMutexLocker lock(&g_canvasMutex);
-        const QSize target(qRound(1920 * m_zoom), qRound(1080 * m_zoom));
-        QRect dst(QPoint(0,0), target);
-        p.drawImage(dst, g_canvas);
+
+        const QRectF target = canvasDisplayRect();
+        p.drawImage(target, g_canvas);
     }
 
     void mousePressEvent(QMouseEvent *e) override
     {
-        if (e->button() != Qt::LeftButton || g_memberLocked) return;
-        const QPoint p = mapToCanvasPointScaled(e->position().toPoint());
+        if (e->button() != Qt::LeftButton || g_memberLocked)
+            return;
+
+        QPoint p;
+        if (!mapWidgetToCanvas(e->position().toPoint(), p))
+            return;
+
         if (m_tool == HostTool::Text) {
             bool ok = false;
-            const QString text = QInputDialog::getText(this, "Insert Text", "Text:", QLineEdit::Normal, QString(), &ok);
+            const QString text = QInputDialog::getText(
+                this, QStringLiteral("Insert Text"), QStringLiteral("Text:"),
+                QLineEdit::Normal, QString(), &ok);
+
             if (ok && !text.isEmpty()) {
-                if (m_undo) pushCanvasSnapshot(*m_undo, *m_redo);
+                if (m_undo)
+                    pushCanvasSnapshot(*m_undo, *m_redo);
+
                 QMutexLocker lock(&g_canvasMutex);
-                QPainter painter(&g_canvas); painter.setRenderHint(QPainter::TextAntialiasing, true);
-                QFont f; f.setPointSize(qMax(8, g_brushSize * 2)); painter.setFont(f); painter.setPen(g_penColor);
-                painter.drawText(p, text); ++g_canvasRevision;
+                QPainter painter(&g_canvas);
+                painter.setRenderHint(QPainter::TextAntialiasing, true);
+                QFont f;
+                f.setPixelSize(qMax(16, g_brushSize * 3));
+                painter.setFont(f);
+                painter.setPen(g_penColor);
+                painter.drawText(p, text);
+                ++g_canvasRevision;
                 update();
             }
             return;
         }
-        if (m_undo) pushCanvasSnapshot(*m_undo, *m_redo);
+
+        if (m_undo)
+            pushCanvasSnapshot(*m_undo, *m_redo);
+
         g_drawing = true;
         g_lastPoint = p;
         g_shapeStart = p;
+
         if (m_tool == HostTool::Pen || m_tool == HostTool::Eraser) {
-            QPen pen(m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
-                     m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
-                     Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-            drawLineOnCanvas(p, p, pen, m_tool == HostTool::Eraser ? QPainter::CompositionMode_Clear : QPainter::CompositionMode_SourceOver);
+            QPen pen(
+                m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
+                m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
+                Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+
+            drawLineOnCanvas(
+                p, p, pen,
+                m_tool == HostTool::Eraser
+                    ? QPainter::CompositionMode_Clear
+                    : QPainter::CompositionMode_SourceOver);
             update();
         }
     }
 
     void mouseMoveEvent(QMouseEvent *e) override
     {
-        if (!g_drawing || g_memberLocked) return;
-        const QPoint p = mapToCanvasPointScaled(e->position().toPoint());
+        if (!g_drawing || g_memberLocked)
+            return;
+
+        QPoint p;
+        if (!mapWidgetToCanvas(e->position().toPoint(), p))
+            return;
+
         if (m_tool == HostTool::Pen || m_tool == HostTool::Eraser) {
-            QPen pen(m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
-                     m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
-                     Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-            drawLineOnCanvas(g_lastPoint, p, pen, m_tool == HostTool::Eraser ? QPainter::CompositionMode_Clear : QPainter::CompositionMode_SourceOver);
-            g_lastPoint = p; update();
+            QPen pen(
+                m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
+                m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
+                Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+
+            drawLineOnCanvas(
+                g_lastPoint, p, pen,
+                m_tool == HostTool::Eraser
+                    ? QPainter::CompositionMode_Clear
+                    : QPainter::CompositionMode_SourceOver);
+
+            g_lastPoint = p;
+            update();
         }
     }
 
     void mouseReleaseEvent(QMouseEvent *e) override
     {
-        if (e->button() != Qt::LeftButton || !g_drawing) return;
-        const QPoint p = mapToCanvasPointScaled(e->position().toPoint());
-        if (m_tool != HostTool::Pen && m_tool != HostTool::Eraser) {
-            drawShapeOnCanvas(g_shapeStart, p, m_tool);
+        if (e->button() != Qt::LeftButton || !g_drawing)
+            return;
+
+        QPoint p;
+        if (!mapWidgetToCanvas(e->position().toPoint(), p)) {
+            g_drawing = false;
+            update();
+            return;
         }
-        g_drawing = false; update();
+
+        if (m_tool != HostTool::Pen && m_tool != HostTool::Eraser)
+            drawShapeOnCanvas(g_shapeStart, p, m_tool);
+
+        g_drawing = false;
+        update();
     }
 
 private:
@@ -265,10 +335,42 @@ private:
     double m_zoom = 1.0;
     std::vector<QImage> *m_undo = nullptr;
     std::vector<QImage> *m_redo = nullptr;
-    QPoint mapToCanvasPointScaled(const QPoint &p) const {
-        const double sx = 1920.0 / qMax(1, width());
-        const double sy = 1080.0 / qMax(1, height());
-        return QPoint(qBound(0, qRound(p.x() * sx), 1919), qBound(0, qRound(p.y() * sy), 1079));
+
+    QRectF canvasDisplayRect() const
+    {
+        if (width() <= 0 || height() <= 0)
+            return QRectF();
+
+        constexpr double aspect = 1920.0 / 1080.0;
+        double w = width();
+        double h = w / aspect;
+
+        if (h > height()) {
+            h = height();
+            w = h * aspect;
+        }
+
+        w *= m_zoom;
+        h *= m_zoom;
+
+        return QRectF(
+            (width() - w) * 0.5,
+            (height() - h) * 0.5,
+            w, h);
+    }
+
+    bool mapWidgetToCanvas(const QPoint &point, QPoint &out) const
+    {
+        const QRectF rect = canvasDisplayRect();
+        if (!rect.contains(QPointF(point)))
+            return false;
+
+        const double nx = (point.x() - rect.left()) / rect.width();
+        const double ny = (point.y() - rect.top()) / rect.height();
+
+        out.setX(qBound(0, qRound(nx * 1919.0), 1919));
+        out.setY(qBound(0, qRound(ny * 1079.0), 1079));
+        return true;
     }
 };
 
@@ -467,17 +569,38 @@ private:
         if(canvasExists){ createLocalObsSource(); auto *host=new HostDrawDialog(this); host->setAttribute(Qt::WA_DeleteOnClose,true); host->show();host->raise();host->activateWindow();g_canvasVisible=true;setStatus("Canvas Active",true); }
     }
     void createLocalObsSource(){
-        obs_source_t *existing=obs_get_source_by_name("VyanHQ Draw");
-        if(!existing){
-            obs_data_t *d=obs_data_create();
-            obs_source_t *src=obs_source_create("vyanhq_draw_local","VyanHQ Draw",d,nullptr);
+        const char *sourceName = "VyanHQ Draw";
+        obs_source_t *existing = obs_get_source_by_name(sourceName);
+        if (!existing) {
+            obs_data_t *d = obs_data_create();
+            obs_source_t *src = obs_source_create("vyanhq_draw_local", sourceName, d, nullptr);
             obs_data_release(d);
-            if(src){
-                obs_source_t *current=obs_frontend_get_current_scene();
-                if(current){obs_scene_t *scene=obs_scene_from_source(current);if(scene)obs_scene_add(scene,src);obs_source_release(current);} 
+            if (src) {
+                obs_source_set_enabled(src, true);
+                obs_source_t *current = obs_frontend_get_current_scene();
+                if (current) {
+                    obs_scene_t *scene = obs_scene_from_source(current);
+                    if (scene) {
+                        obs_sceneitem_t *item = obs_scene_add(scene, src);
+                        if (item) {
+                            obs_sceneitem_set_visible(item, true);
+                            obs_sceneitem_set_locked(item, false);
+                            struct vec2 pos = {0.0f, 0.0f};
+                            obs_sceneitem_set_pos(item, &pos);
+                            struct vec2 scale = {1.0f, 1.0f};
+                            obs_sceneitem_set_scale(item, &scale);
+                            obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
+                        }
+                    }
+                    obs_source_release(current);
+                }
                 obs_source_release(src);
             }
-        } else obs_source_release(existing);
+        } else {
+            obs_source_set_enabled(existing, true);
+            obs_source_release(existing);
+        }
+        g_canvasVisible = true;
     }
     void createMemberOverlaySource(){
         if(!memberRoomActive)return;
