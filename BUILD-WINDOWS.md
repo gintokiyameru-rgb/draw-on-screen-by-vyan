@@ -1,5 +1,6 @@
-# Windows build
+# Build
 
-This repository expects a GitHub Actions build on `windows-2022`. The workflow builds the native OBS plugin for x64 and uploads a packaged artifact.
+Upload this project's contents to the root of your GitHub repository, then run:
+Actions -> Build VyanHQ Draw for Windows x64 -> Run workflow.
 
-For local building, use Visual Studio 2022 with Desktop development with C++, CMake, Windows SDK, and an OBS 32.2.2-compatible build environment.
+The workflow targets OBS Studio 32.2.2 / Windows x64 and enables OBS frontend API + Qt.
