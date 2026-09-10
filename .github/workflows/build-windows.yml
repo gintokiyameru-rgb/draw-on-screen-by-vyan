@@ -30,52 +30,66 @@ jobs:
         working-directory: obs-template
         run: |
           $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
-
-          # Set existing scalar properties instead of Add-Member. This works
-          # whether the template already contains an empty email property.
           $spec.email = "vyanhq@example.invalid"
 
-          if (-not $spec.platformConfig) {
-            $spec | Add-Member -NotePropertyName platformConfig -NotePropertyValue ([pscustomobject]@{})
+          if (-not ($spec.PSObject.Properties.Name -contains 'platformConfig')) {
+            $spec | Add-Member -NotePropertyName platformConfig -NotePropertyValue ([pscustomobject]@{}) -Force
+          }
+          if (-not ($spec.platformConfig.PSObject.Properties.Name -contains 'macos')) {
+            $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{}) -Force
+          }
+          if (-not ($spec.platformConfig.macos.PSObject.Properties.Name -contains 'bundleId')) {
+            $spec.platformConfig.macos | Add-Member -NotePropertyName bundleId -NotePropertyValue "com.vyanhq.vyanhq-draw" -Force
+          } else {
+            $spec.platformConfig.macos.bundleId = "com.vyanhq.vyanhq-draw"
           }
 
-          if (-not $spec.platformConfig.macos) {
-            $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{})
+          if (-not ($spec.PSObject.Properties.Name -contains 'dependencies')) {
+            throw "buildspec.json is missing the dependencies object."
           }
-          $spec.platformConfig.macos.bundleId = "com.vyanhq.vyanhq-draw"
+          if (-not ($spec.dependencies.PSObject.Properties.Name -contains 'obs-studio')) {
+            throw "buildspec.json is missing dependencies.obs-studio."
+          }
 
-          # Fix the OBS 32.2.2 source hash for the dependency resolver.
           $obsUrl = "https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip"
           $obsZip = Join-Path $env:GITHUB_WORKSPACE "obs-32.2.2.zip"
           Invoke-WebRequest -Uri $obsUrl -OutFile $obsZip
           $obsHash = (Get-FileHash $obsZip -Algorithm SHA256).Hash.ToLowerInvariant()
           $spec.dependencies.'obs-studio'.hashes.'windows-x64' = $obsHash
           Remove-Item $obsZip -Force
+          $spec | ConvertTo-Json -Depth 100 | Set-Content buildspec.json -Encoding UTF8
 
-          $spec | ConvertTo-Json -Depth 50 | Set-Content buildspec.json -Encoding UTF8
-
-          # Enable Qt + OBS frontend API in every preset object that defines cacheVariables.
+          # The current OBS template has presets that explicitly set these two options
+          # to OFF. Add/overwrite them safely with Add-Member -Force so the property may
+          # be created when it does not exist.
           $presets = Get-Content CMakePresets.json -Raw | ConvertFrom-Json
 
-          function Patch-Preset($node) {
+          function Ensure-CacheVariables($node) {
             if ($null -eq $node) { return }
-            if ($node.PSObject.Properties.Name -contains 'cacheVariables') {
-              if (-not $node.cacheVariables) {
-                $node.cacheVariables = [pscustomobject]@{}
+            $props = @($node.PSObject.Properties.Name)
+            if ($props -contains 'cacheVariables') {
+              if ($null -eq $node.cacheVariables) {
+                $node | Add-Member -NotePropertyName cacheVariables -NotePropertyValue ([pscustomobject]@{}) -Force
               }
-              $node.cacheVariables.ENABLE_FRONTEND_API = 'ON'
-              $node.cacheVariables.ENABLE_QT = 'ON'
+              $node.cacheVariables | Add-Member -NotePropertyName ENABLE_FRONTEND_API -NotePropertyValue 'ON' -Force
+              $node.cacheVariables | Add-Member -NotePropertyName ENABLE_QT -NotePropertyValue 'ON' -Force
             }
-            if ($node.PSObject.Properties.Name -contains 'configurePresets') {
-              foreach ($p in $node.configurePresets) { Patch-Preset $p }
+
+            if ($props -contains 'configurePresets') {
+              foreach ($p in @($node.configurePresets)) { Ensure-CacheVariables $p }
             }
-            if ($node.PSObject.Properties.Name -contains 'buildPresets') {
-              foreach ($p in $node.buildPresets) { Patch-Preset $p }
+            if ($props -contains 'buildPresets') {
+              foreach ($p in @($node.buildPresets)) { Ensure-CacheVariables $p }
             }
           }
 
-          Patch-Preset $presets
-          $presets | ConvertTo-Json -Depth 50 | Set-Content CMakePresets.json -Encoding UTF8
+          Ensure-CacheVariables $presets
+          $presets | ConvertTo-Json -Depth 100 | Set-Content CMakePresets.json -Encoding UTF8
+
+          Write-Host "=== Patched buildspec ==="
+          Get-Content buildspec.json
+          Write-Host "=== Relevant CMake presets ==="
+          Get-Content CMakePresets.json | Select-String -Pattern 'windows-ci-x64|windows-x64|ENABLE_FRONTEND_API|ENABLE_QT' -Context 0,3
 
       - name: Build with official OBS Windows build script
         shell: pwsh
@@ -83,12 +97,18 @@ jobs:
         run: |
           ./.github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
 
-      - name: Upload build logs and release files
+      - name: Package Windows plugin
+        shell: pwsh
+        working-directory: obs-template
+        run: |
+          ./.github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+
+      - name: Upload build and release artifact
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: VyanHQ-Draw-debug
+          name: VyanHQ-Draw-OBS-Windows-x64
           path: |
-            obs-template/build/**
             obs-template/release/**
+            obs-template/build/**
           if-no-files-found: ignore
