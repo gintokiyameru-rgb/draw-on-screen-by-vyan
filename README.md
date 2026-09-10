@@ -1,3 +1,5 @@
-# VyanHQ Draw v1.15
+VyanHQ Draw v1.16
 
-Compact OBS dock. DRAW is independent from CONNECT/member room. DRAW opens the Create Canvas dialog first; only after confirming creation will the one-time backend setup be requested if necessary. CONNECT remains the separate member-room creator.
+DRAW is a completely local/private OBS drawing canvas. It does not create or require a Cloudflare member room.
+CONNECT is only for creating the collaborative member room and its cloud connection.
+The profile-outline button copies the member link. OBS hotkeys control member clear, member lock/unlock, private canvas clear, and private canvas visibility.
