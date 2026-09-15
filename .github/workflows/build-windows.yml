@@ -33,26 +33,11 @@ jobs:
         run: |
           $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
           $spec.email = "vyanhq@example.invalid"
-
-          if (-not ($spec.PSObject.Properties.Name -contains 'platformConfig')) {
-            $spec | Add-Member -NotePropertyName platformConfig -NotePropertyValue ([pscustomobject]@{}) -Force
-          }
-          if (-not ($spec.platformConfig.PSObject.Properties.Name -contains 'macos')) {
-            $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{}) -Force
-          }
-          if (-not ($spec.platformConfig.macos.PSObject.Properties.Name -contains 'bundleId')) {
-            $spec.platformConfig.macos | Add-Member -NotePropertyName bundleId -NotePropertyValue "com.vyanhq.vyanhq-draw" -Force
-          } else {
-            $spec.platformConfig.macos.bundleId = "com.vyanhq.vyanhq-draw"
-          }
-
-          if (-not ($spec.PSObject.Properties.Name -contains 'dependencies')) {
-            throw "buildspec.json is missing the dependencies object."
-          }
-          if (-not ($spec.dependencies.PSObject.Properties.Name -contains 'obs-studio')) {
-            throw "buildspec.json is missing dependencies.obs-studio."
-          }
-
+          if (-not ($spec.PSObject.Properties.Name -contains 'platformConfig')) { $spec | Add-Member -NotePropertyName platformConfig -NotePropertyValue ([pscustomobject]@{}) -Force }
+          if (-not ($spec.platformConfig.PSObject.Properties.Name -contains 'macos')) { $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{}) -Force }
+          if (-not ($spec.platformConfig.macos.PSObject.Properties.Name -contains 'bundleId')) { $spec.platformConfig.macos | Add-Member -NotePropertyName bundleId -NotePropertyValue "com.vyanhq.vyanhq-draw" -Force } else { $spec.platformConfig.macos.bundleId = "com.vyanhq.vyanhq-draw" }
+          if (-not ($spec.PSObject.Properties.Name -contains 'dependencies')) { throw "buildspec.json is missing the dependencies object." }
+          if (-not ($spec.dependencies.PSObject.Properties.Name -contains 'obs-studio')) { throw "buildspec.json is missing dependencies.obs-studio." }
           $obsUrl = "https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip"
           $obsZip = Join-Path $env:GITHUB_WORKSPACE "obs-32.2.2.zip"
           Invoke-WebRequest -Uri $obsUrl -OutFile $obsZip
@@ -60,27 +45,18 @@ jobs:
           $spec.dependencies.'obs-studio'.hashes.'windows-x64' = $obsHash
           Remove-Item $obsZip -Force
           $spec | ConvertTo-Json -Depth 100 | Set-Content buildspec.json -Encoding UTF8
-
           $presets = Get-Content CMakePresets.json -Raw | ConvertFrom-Json
-
           function Ensure-CacheVariables($node) {
             if ($null -eq $node) { return }
             $props = @($node.PSObject.Properties.Name)
             if ($props -contains 'cacheVariables') {
-              if ($null -eq $node.cacheVariables) {
-                $node | Add-Member -NotePropertyName cacheVariables -NotePropertyValue ([pscustomobject]@{}) -Force
-              }
+              if ($null -eq $node.cacheVariables) { $node | Add-Member -NotePropertyName cacheVariables -NotePropertyValue ([pscustomobject]@{}) -Force }
               $node.cacheVariables | Add-Member -NotePropertyName ENABLE_FRONTEND_API -NotePropertyValue 'ON' -Force
               $node.cacheVariables | Add-Member -NotePropertyName ENABLE_QT -NotePropertyValue 'ON' -Force
             }
-            if ($props -contains 'configurePresets') {
-              foreach ($p in @($node.configurePresets)) { Ensure-CacheVariables $p }
-            }
-            if ($props -contains 'buildPresets') {
-              foreach ($p in @($node.buildPresets)) { Ensure-CacheVariables $p }
-            }
+            if ($props -contains 'configurePresets') { foreach ($p in @($node.configurePresets)) { Ensure-CacheVariables $p } }
+            if ($props -contains 'buildPresets') { foreach ($p in @($node.buildPresets)) { Ensure-CacheVariables $p } }
           }
-
           Ensure-CacheVariables $presets
           $presets | ConvertTo-Json -Depth 100 | Set-Content CMakePresets.json -Encoding UTF8
 
@@ -90,12 +66,11 @@ jobs:
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE "obs-template\src\plugin-main.cpp"
           $text = Get-Content $path -Raw
-          $pattern = '(?s)static void sourceVideoRender\(void \*data, gs_effect_t \*effect\)\n\{.*?\n\}\n\nstatic obs_source_info g_sourceInfoInit'
+          $pattern = '(?s)static void sourceVideoRender\(void \*data, gs_effect_t \*effect\)\n\{.*?\n\}\n\nstatic obs_source_info g_sourceInfoInit\(\)'
           $replacement = @'
 static void sourceVideoRender(void *data, gs_effect_t *effect)
 {
     Q_UNUSED(data);
-
     if (!g_visible || !effect)
         return;
 
@@ -123,24 +98,19 @@ static void sourceVideoRender(void *data, gs_effect_t *effect)
         g_textureRevision = revision;
     }
 
-    // OBS input sources without OBS_SOURCE_CUSTOM_DRAW receive the active
-    // effect from libobs. Set its image parameter and draw our texture into
-    // the current scene framebuffer, matching the built-in image source path.
     const bool previousSrgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(true);
     gs_blend_state_push();
     gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
-
     gs_eparam_t *const imageParam = gs_effect_get_param_by_name(effect, "image");
     if (imageParam)
         gs_effect_set_texture_srgb(imageParam, g_texture);
     gs_draw_sprite(g_texture, 0, kCanvasW, kCanvasH);
-
     gs_blend_state_pop();
     gs_enable_framebuffer_srgb(previousSrgb);
 }
 
-static obs_source_info g_sourceInfoInit
+static obs_source_info g_sourceInfoInit()
 '@
           $newText = [regex]::Replace($text, $pattern, $replacement, 1)
           if ($newText -eq $text) { throw "Could not locate sourceVideoRender block to patch." }
