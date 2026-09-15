@@ -240,13 +240,34 @@ static const char *sourceGetName(void *)
     return "VyanHQ Draw";
 }
 
-static void *sourceCreate(obs_data_t *, obs_source_t *)
+struct SourceState {
+    obs_source_t *source = nullptr;
+};
+
+static void *sourceCreate(obs_data_t *, obs_source_t *source)
 {
     ensureDocument();
-    return nullptr;
+    auto *state = new SourceState;
+    state->source = source;
+    return state;
 }
 
-static void sourceDestroy(void *) {}
+static void sourceDestroy(void *data)
+{
+    delete static_cast<SourceState *>(data);
+}
+
+static void sourceShow(void *data)
+{
+    Q_UNUSED(data);
+    blog(LOG_INFO, "[VyanHQ Draw] native source shown");
+}
+
+static void sourceHide(void *data)
+{
+    Q_UNUSED(data);
+    blog(LOG_INFO, "[VyanHQ Draw] native source hidden");
+}
 static uint32_t sourceWidth(void *) { return kCanvasW; }
 static uint32_t sourceHeight(void *) { return kCanvasH; }
 
@@ -257,9 +278,11 @@ static obs_properties_t *sourceProperties(void *)
     return props;
 }
 
-static void sourceVideoRender(void *, gs_effect_t *effect)
+static void sourceVideoRender(void *data, gs_effect_t *effect)
 {
+    Q_UNUSED(data);
     Q_UNUSED(effect);
+
     if (!g_visible)
         return;
 
@@ -272,11 +295,14 @@ static void sourceVideoRender(void *, gs_effect_t *effect)
         revision = g_revision;
     }
 
-    if (!g_texture)
+    if (!g_texture) {
         g_texture = gs_texture_create(kCanvasW, kCanvasH, GS_RGBA, 1, nullptr, GS_DYNAMIC);
-
-    if (!g_texture)
-        return;
+        if (!g_texture) {
+            blog(LOG_WARNING, "[VyanHQ Draw] failed to create native canvas texture");
+            return;
+        }
+        g_textureRevision = 0;
+    }
 
     if (revision != g_textureRevision) {
         QImage rgba = composite.convertToFormat(QImage::Format_RGBA8888);
@@ -284,7 +310,25 @@ static void sourceVideoRender(void *, gs_effect_t *effect)
         g_textureRevision = revision;
     }
 
-    obs_source_draw(g_texture, 0, 0, kCanvasW, kCanvasH, false);
+    // Use the same native OBS effect pipeline used by synchronous sources.
+    // This avoids relying on the caller-provided effect and makes the source
+    // behave like a normal native transparent texture source.
+    gs_effect_t *drawEffect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+    if (!drawEffect)
+        return;
+
+    gs_eparam_t *imageParam = gs_effect_get_param_by_name(drawEffect, "image");
+    if (!imageParam)
+        return;
+
+    gs_effect_set_texture(imageParam, g_texture);
+
+    gs_blend_state_push();
+    gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+    while (gs_effect_loop(drawEffect, "Draw")) {
+        gs_draw_sprite(g_texture, 0, kCanvasW, kCanvasH);
+    }
+    gs_blend_state_pop();
 }
 
 static obs_source_info g_sourceInfoInit()
@@ -292,7 +336,7 @@ static obs_source_info g_sourceInfoInit()
     obs_source_info info{};
     info.id = "vyanhq_draw";
     info.type = OBS_SOURCE_TYPE_INPUT;
-    info.output_flags = OBS_SOURCE_VIDEO;
+    info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
     info.get_name = sourceGetName;
     info.create = sourceCreate;
     info.destroy = sourceDestroy;
@@ -300,6 +344,8 @@ static obs_source_info g_sourceInfoInit()
     info.get_height = sourceHeight;
     info.get_properties = sourceProperties;
     info.video_render = sourceVideoRender;
+    info.show = sourceShow;
+    info.hide = sourceHide;
     return info;
 }
 
