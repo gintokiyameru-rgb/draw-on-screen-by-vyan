@@ -54,10 +54,6 @@ jobs:
           Fix-Node $presets
           $presets | ConvertTo-Json -Depth 100 | Set-Content CMakePresets.json -Encoding UTF8
 
-      - name: Fix native OBS compositor rendering
-        shell: pwsh
-        run: ./scripts/fix-native-render.ps1
-
       - name: Prepare v2 source
         shell: pwsh
         run: ./scripts/prepare-v2-build.ps1
