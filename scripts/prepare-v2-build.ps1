@@ -13,7 +13,8 @@ if ($text -notmatch 'obs_source_info g_sourceInfo') {
     $text = $text.Replace('VyanDock *g_ui = nullptr;', 'VyanDock *g_ui = nullptr;' + $newline + 'obs_source_info g_sourceInfo{};')
 }
 
-$text = $text.Replace('QMetaObject::invokeMethod(g_ui, "refreshCanvas", Qt::QueuedConnection);', 'requestUiRefresh();')
+# Always replace early refresh calls with a helper because VyanDock is incomplete here.
+$text = [regex]::Replace($text, 'QMetaObject::invokeMethod\(g_ui,\s*"refreshCanvas",\s*Qt::QueuedConnection\);', 'requestUiRefresh();')
 if ($text -notmatch 'void requestUiRefresh\(\);') {
     $text = $text.Replace('void clearCanvasLocal()', 'void requestUiRefresh();' + $newline + $newline + 'void clearCanvasLocal()')
 }
@@ -45,4 +46,4 @@ if ($text -notmatch 'void requestUiRefresh\(\)\s*\{') {
 }
 
 Set-Content -Path $path -Value $text -Encoding UTF8
-Write-Host 'Prepared VyanHQ v2 source with remaining OBS 32.2.2 compile fixes.'
+Write-Host 'Prepared VyanHQ v2 source with robust OBS 32.2.2 compile fixes.'
