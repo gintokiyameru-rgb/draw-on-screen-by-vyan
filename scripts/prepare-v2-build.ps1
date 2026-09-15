@@ -8,11 +8,11 @@ if ($text -notmatch '#include <QTcpSocket>') {
 }
 
 if ($text -notmatch 'obs_source_info g_sourceInfo') {
-  $text = $text.Replace('VyanDock *g_ui = nullptr;', "VyanDock *g_ui = nullptr;$newline`nobs_source_info g_sourceInfo{};")
+  $text = $text.Replace('VyanDock *g_ui = nullptr;', "VyanDock *g_ui = nullptr;$newline obs_source_info g_sourceInfo{};")
 }
 
 if ($text -notmatch 'void requestUiRefresh\(\);') {
-  $text = $text.Replace('void clearCanvasLocal()\n{', "void requestUiRefresh();$newline`n$newlinevoid clearCanvasLocal()$newline{")
+  $text = $text.Replace('void clearCanvasLocal()' + $newline + '{', "void requestUiRefresh();$newline$newlinevoid clearCanvasLocal()$newline{")
 }
 
 $text = $text.Replace('QMetaObject::invokeMethod(g_ui, "refreshCanvas", Qt::QueuedConnection);', 'requestUiRefresh();')
@@ -25,9 +25,9 @@ $text = $text.Replace('            s.setValue("relay", url->text().trimmed());',
 $text = $text.Replace('            s.setValue("room", room->text().trimmed());', '            settings.setValue("room", room->text().trimmed());')
 
 if ($text -notmatch 'void requestUiRefresh\(\)\s*\{') {
-  $marker = "public:`n    void setStatus(const QString &s) { m_status->setText(\"● \" + s); }"
-  $insert = $marker + "$newline}`n`nvoid requestUiRefresh()`n{`n    if (g_ui) QTimer::singleShot(0, [ui = g_ui]() { if (ui) ui->refreshCanvas(); });`n"
-  $text = $text.Replace($marker, $insert)
+  $marker = '};' + $newline + $newline + 'static const char *sourceGetName'
+  $replacement = '};' + $newline + $newline + 'void requestUiRefresh()' + $newline + '{' + $newline + '    if (g_ui) QTimer::singleShot(0, [ui = g_ui]() { if (ui) ui->refreshCanvas(); });' + $newline + '}' + $newline + $newline + 'static const char *sourceGetName'
+  $text = $text.Replace($marker, $replacement)
 }
 
 Set-Content -Path $path -Value $text -Encoding UTF8
