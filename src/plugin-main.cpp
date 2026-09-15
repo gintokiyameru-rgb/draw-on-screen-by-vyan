@@ -5,6 +5,7 @@
 
 #include <QApplication>
 #include <QColorDialog>
+#include <QClipboard>
 #include <QDialog>
 #include <QDockWidget>
 #include <QFontDialog>
@@ -700,8 +701,10 @@ private:
                 if (!exists) {
                     obs_sceneitem_t *item = obs_scene_add(scene, src);
                     if (item) {
-                        obs_sceneitem_set_pos(item, vec2{0.0f, 0.0f});
-                        obs_sceneitem_set_scale(item, vec2{1.0f, 1.0f});
+                        vec2 pos{0.0f, 0.0f};
+                        obs_sceneitem_set_pos(item, &pos);
+                        vec2 scale{1.0f, 1.0f};
+                        obs_sceneitem_set_scale(item, &scale);
                         obs_sceneitem_set_visible(item, true);
                     }
                 }
