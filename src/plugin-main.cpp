@@ -4,446 +4,562 @@
 #include <graphics/graphics.h>
 
 #include <QApplication>
-#include <QClipboard>
 #include <QColorDialog>
-#include <QInputDialog>
-#include <QKeyEvent>
-#include <QToolButton>
-#include <QStatusBar>
-#include <vector>
-#include <algorithm>
-#include <cmath>
 #include <QDialog>
 #include <QDockWidget>
+#include <QFontDialog>
 #include <QHBoxLayout>
 #include <QImage>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QMutex>
 #include <QMutexLocker>
-#include <QNetworkAccessManager>
-#include <QNetworkReply>
-#include <QNetworkRequest>
 #include <QPainter>
-#include <QPaintEvent>
 #include <QPushButton>
 #include <QSettings>
-#include <QSizePolicy>
 #include <QSlider>
+#include <QSizePolicy>
+#include <QToolButton>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QVBoxLayout>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QUuid>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QList>
+#include <QPair>
+#include <QtMath>
+
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <vector>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("vyanhq-draw", "en-US")
 
-static QDockWidget *g_dock = nullptr;
-static class VyanDock *g_ui = nullptr;
-static obs_hotkey_id g_clearMembers = OBS_INVALID_HOTKEY_ID;
-static obs_hotkey_id g_clearMine = OBS_INVALID_HOTKEY_ID;
-static obs_hotkey_id g_lock = OBS_INVALID_HOTKEY_ID;
-static obs_hotkey_id g_unlock = OBS_INVALID_HOTKEY_ID;
-static obs_hotkey_id g_toggle = OBS_INVALID_HOTKEY_ID;
+namespace {
+constexpr int kCanvasW = 1920;
+constexpr int kCanvasH = 1080;
+constexpr int kMaxUndo = 40;
 
-static QMutex g_canvasMutex;
-static QImage g_canvas(1920, 1080, QImage::Format_RGBA8888);
-static uint64_t g_canvasRevision = 1;
-static bool g_canvasVisible = true;
-static bool g_memberLocked = false;
-static int g_brushSize = 8;
-static int g_eraserSize = 32;
-static QColor g_penColor(255, 255, 255, 255);
-static bool g_eraser = false;
-static QPoint g_lastPoint;
-static QPoint g_shapeStart;
-static bool g_drawing = false;
-static gs_texture_t *g_localTexture = nullptr;
-static uint64_t g_uploadedRevision = 0;
-static obs_source_info g_localSourceInfo{};
+QDockWidget *g_dock = nullptr;
+class VyanDock;
+VyanDock *g_ui = nullptr;
+obs_source_info g_sourceInfo{};
+obs_hotkey_id g_clearMine = OBS_INVALID_HOTKEY_ID;
+obs_hotkey_id g_toggleCanvas = OBS_INVALID_HOTKEY_ID;
 
-enum class HostTool { Pen, Eraser, Line, Rectangle, Ellipse, Arrow, Text };
-static HostTool g_hostTool = HostTool::Pen;
+QMutex g_docMutex;
 
-static void clearPrivateCanvas()
+enum class Tool { Pen, Eraser, Line, Rect, Ellipse, Arrow, Text };
+
+struct Layer {
+    QString name;
+    QImage image;
+};
+
+struct Snapshot {
+    std::vector<Layer> layers;
+    int active = 0;
+};
+
+std::vector<Layer> g_layers;
+int g_activeLayer = 0;
+std::vector<Snapshot> g_undo;
+std::vector<Snapshot> g_redo;
+uint64_t g_revision = 1;
+
+QColor g_color(255, 255, 255, 255);
+int g_brush = 8;
+int g_eraser = 32;
+bool g_visible = true;
+
+// OBS GPU texture for the native source.
+gs_texture_t *g_texture = nullptr;
+uint64_t g_textureRevision = 0;
+
+QImage compositeDocument()
 {
-    QMutexLocker lock(&g_canvasMutex);
-    g_canvas.fill(Qt::transparent);
-    ++g_canvasRevision;
-}
-
-static void pushCanvasSnapshot(std::vector<QImage> &undo, std::vector<QImage> &redo)
-{
-    QMutexLocker lock(&g_canvasMutex);
-    undo.push_back(g_canvas);
-    if (undo.size() > 50) undo.erase(undo.begin());
-    redo.clear();
-}
-
-static void restoreCanvasFrom(QImage img)
-{
-    QMutexLocker lock(&g_canvasMutex);
-    g_canvas = std::move(img);
-    ++g_canvasRevision;
-}
-
-static QPoint mapToCanvasPoint(const QWidget *w, const QPoint &p)
-{
-    const double sx = 1920.0 / qMax(1, w->width());
-    const double sy = 1080.0 / qMax(1, w->height());
-    return QPoint(qBound(0, qRound(p.x() * sx), 1919), qBound(0, qRound(p.y() * sy), 1079));
-}
-
-static void drawLineOnCanvas(const QPoint &a, const QPoint &b, const QPen &pen,
-                             QPainter::CompositionMode mode = QPainter::CompositionMode_SourceOver)
-{
-    QMutexLocker lock(&g_canvasMutex);
-    QPainter p(&g_canvas);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    p.setCompositionMode(mode);
-    p.setPen(pen);
-    p.drawLine(a, b);
-    ++g_canvasRevision;
-}
-
-static void drawShapeOnCanvas(const QPoint &a, const QPoint &b, HostTool tool)
-{
-    QMutexLocker lock(&g_canvasMutex);
-    QPainter p(&g_canvas);
-    p.setRenderHint(QPainter::Antialiasing, true);
+    QImage result(kCanvasW, kCanvasH, QImage::Format_RGBA8888);
+    result.fill(Qt::transparent);
+    QPainter p(&result);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-    QPen pen(g_penColor, g_brushSize, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-    p.setPen(pen);
+    for (const Layer &layer : g_layers)
+        p.drawImage(0, 0, layer.image);
+    p.end();
+    return result;
+}
+
+void ensureDocument()
+{
+    if (g_layers.empty()) {
+        Layer l;
+        l.name = QStringLiteral("My Drawing");
+        l.image = QImage(kCanvasW, kCanvasH, QImage::Format_RGBA8888);
+        l.image.fill(Qt::transparent);
+        g_layers.push_back(std::move(l));
+        g_activeLayer = 0;
+    }
+}
+
+void snapshotPush()
+{
+    QMutexLocker lock(&g_docMutex);
+    Snapshot s;
+    s.active = g_activeLayer;
+    s.layers = g_layers;
+    g_undo.push_back(std::move(s));
+    if ((int)g_undo.size() > kMaxUndo)
+        g_undo.erase(g_undo.begin());
+    g_redo.clear();
+}
+
+void touchDocument()
+{
+    ++g_revision;
+}
+
+void clearMyCanvas()
+{
+    QMutexLocker lock(&g_docMutex);
+    ensureDocument();
+    g_layers[g_activeLayer].image.fill(Qt::transparent);
+    touchDocument();
+}
+
+void restoreSnapshot(const Snapshot &s)
+{
+    QMutexLocker lock(&g_docMutex);
+    g_layers = s.layers;
+    g_activeLayer = qBound(0, s.active, qMax(0, (int)g_layers.size() - 1));
+    touchDocument();
+}
+
+QRectF canvasDisplayRect(const QWidget *widget, double zoom)
+{
+    const double baseW = kCanvasW * zoom;
+    const double baseH = kCanvasH * zoom;
+    const double scale = qMin(widget->width() / baseW, widget->height() / baseH);
+    const double w = baseW * scale;
+    const double h = baseH * scale;
+    const double x = (widget->width() - w) * 0.5;
+    const double y = (widget->height() - h) * 0.5;
+    return QRectF(x, y, w, h);
+}
+
+QPoint canvasPointFromWidget(const QWidget *widget, const QPointF &p, double zoom)
+{
+    QRectF r = canvasDisplayRect(widget, zoom);
+    if (r.width() <= 0 || r.height() <= 0)
+        return {};
+    const double nx = qBound(0.0, (p.x() - r.left()) / r.width(), 1.0);
+    const double ny = qBound(0.0, (p.y() - r.top()) / r.height(), 1.0);
+    return QPoint(qBound(0, qRound(nx * (kCanvasW - 1)), kCanvasW - 1),
+                  qBound(0, qRound(ny * (kCanvasH - 1)), kCanvasH - 1));
+}
+
+QPen makePen(bool erase)
+{
+    const int width = erase ? g_eraser : g_brush;
+    const QColor color = erase ? QColor(Qt::transparent) : g_color;
+    return QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+}
+
+void drawFreehand(const QPoint &a, const QPoint &b, bool erase)
+{
+    QMutexLocker lock(&g_docMutex);
+    ensureDocument();
+    QPainter p(&g_layers[g_activeLayer].image);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setCompositionMode(erase ? QPainter::CompositionMode_Clear : QPainter::CompositionMode_SourceOver);
+    p.setPen(makePen(erase));
+    p.drawLine(a, b);
+    p.end();
+    touchDocument();
+}
+
+void drawShape(const QPoint &a, const QPoint &b, Tool tool)
+{
+    QMutexLocker lock(&g_docMutex);
+    ensureDocument();
+    QPainter p(&g_layers[g_activeLayer].image);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(makePen(false));
     p.setBrush(Qt::NoBrush);
-    const QRect r(QPoint(qMin(a.x(), b.x()), qMin(a.y(), b.y())),
-                  QPoint(qMax(a.x(), b.x()), qMax(a.y(), b.y())));
+    const QRectF rect(QPointF(qMin(a.x(), b.x()), qMin(a.y(), b.y())),
+                      QPointF(qMax(a.x(), b.x()), qMax(a.y(), b.y())));
     switch (tool) {
-    case HostTool::Line: p.drawLine(a, b); break;
-    case HostTool::Rectangle: p.drawRect(r); break;
-    case HostTool::Ellipse: p.drawEllipse(r); break;
-    case HostTool::Arrow: {
+    case Tool::Line: p.drawLine(a, b); break;
+    case Tool::Rect: p.drawRect(rect); break;
+    case Tool::Ellipse: p.drawEllipse(rect); break;
+    case Tool::Arrow: {
         p.drawLine(a, b);
         const QLineF line(a, b);
         const double angle = std::atan2(-line.dy(), line.dx());
-        const double arrowSize = qMax(8, g_brushSize * 2);
-        QPointF p1 = line.p2() - QPointF(std::cos(angle + 3.14159265358979323846 / 6) * arrowSize,
-                                         -std::sin(angle + 3.14159265358979323846 / 6) * arrowSize);
-        QPointF p2 = line.p2() - QPointF(std::cos(angle - 3.14159265358979323846 / 6) * arrowSize,
-                                         -std::sin(angle - 3.14159265358979323846 / 6) * arrowSize);
-        p.drawLine(line.p2(), p1); p.drawLine(line.p2(), p2);
+        const double sz = qMax(10.0, (double)g_brush * 2.2);
+        const QPointF end = line.p2();
+        const QPointF p1 = end - QPointF(std::cos(angle + M_PI / 6.0) * sz,
+                                          -std::sin(angle + M_PI / 6.0) * sz);
+        const QPointF p2 = end - QPointF(std::cos(angle - M_PI / 6.0) * sz,
+                                          -std::sin(angle - M_PI / 6.0) * sz);
+        p.drawLine(end, p1);
+        p.drawLine(end, p2);
         break;
     }
     default: break;
     }
-    ++g_canvasRevision;
+    p.end();
+    touchDocument();
 }
 
-static const char *localSourceGetName(void *) { return "VyanHQ Draw"; }
-static void *localSourceCreate(obs_data_t *, obs_source_t *) { return nullptr; }
-static void localSourceDestroy(void *) {}
-static uint32_t localSourceWidth(void *) { return 1920; }
-static uint32_t localSourceHeight(void *) { return 1080; }
-
-static void localSourceVideoRender(void *, gs_effect_t *effect)
+void drawTextAt(const QPoint &pt, const QString &text)
 {
-    UNUSED_PARAMETER(effect);
+    QMutexLocker lock(&g_docMutex);
+    ensureDocument();
+    QPainter p(&g_layers[g_activeLayer].image);
+    QFont f;
+    f.setPointSize(qMax(14, g_brush * 2));
+    p.setFont(f);
+    p.setPen(g_color);
+    p.drawText(pt, text);
+    p.end();
+    touchDocument();
+}
 
-    if (!g_canvasVisible)
+static const char *sourceGetName(void *)
+{
+    return "VyanHQ Draw";
+}
+
+static void *sourceCreate(obs_data_t *, obs_source_t *)
+{
+    ensureDocument();
+    return nullptr;
+}
+
+static void sourceDestroy(void *) {}
+static uint32_t sourceWidth(void *) { return kCanvasW; }
+static uint32_t sourceHeight(void *) { return kCanvasH; }
+
+static obs_properties_t *sourceProperties(void *)
+{
+    obs_properties_t *props = obs_properties_create();
+    obs_properties_add_text(props, "info", "VyanHQ Draw is a fixed 1920×1080 transparent canvas.", OBS_TEXT_INFO);
+    return props;
+}
+
+static void sourceVideoRender(void *, gs_effect_t *effect)
+{
+    Q_UNUSED(effect);
+    if (!g_visible)
         return;
 
-    QImage copy;
+    QImage composite;
     uint64_t revision = 0;
     {
-        QMutexLocker lock(&g_canvasMutex);
-        copy = g_canvas;
-        revision = g_canvasRevision;
+        QMutexLocker lock(&g_docMutex);
+        ensureDocument();
+        composite = compositeDocument();
+        revision = g_revision;
     }
 
-    if (!g_localTexture)
-        g_localTexture = gs_texture_create(
-            1920, 1080, GS_RGBA, 1, nullptr, GS_DYNAMIC);
+    if (!g_texture)
+        g_texture = gs_texture_create(kCanvasW, kCanvasH, GS_RGBA, 1, nullptr, GS_DYNAMIC);
 
-    if (g_localTexture && revision != g_uploadedRevision) {
-        gs_texture_set_image(
-            g_localTexture,
-            copy.constBits(),
-            static_cast<uint32_t>(copy.bytesPerLine()),
-            false);
-        g_uploadedRevision = revision;
+    if (!g_texture)
+        return;
+
+    if (revision != g_textureRevision) {
+        QImage rgba = composite.convertToFormat(QImage::Format_RGBA8888);
+        gs_texture_set_image(g_texture, rgba.constBits(), (uint32_t)rgba.bytesPerLine(), false);
+        g_textureRevision = revision;
     }
 
-    if (g_localTexture) {
-        // This is a standard synchronous video source. OBS documents that
-        // such sources should use obs_source_draw() when not using
-        // OBS_SOURCE_CUSTOM_DRAW. This also preserves the texture alpha.
-        obs_source_draw(g_localTexture, 0, 0, 1920, 1080, false);
-    }
+    obs_source_draw(g_texture, 0, 0, kCanvasW, kCanvasH, false);
 }
 
-class LocalCanvasWidget final : public QWidget {
+static obs_source_info g_sourceInfoInit()
+{
+    obs_source_info info{};
+    info.id = "vyanhq_draw";
+    info.type = OBS_SOURCE_TYPE_INPUT;
+    info.output_flags = OBS_SOURCE_VIDEO;
+    info.get_name = sourceGetName;
+    info.create = sourceCreate;
+    info.destroy = sourceDestroy;
+    info.get_width = sourceWidth;
+    info.get_height = sourceHeight;
+    info.get_properties = sourceProperties;
+    info.video_render = sourceVideoRender;
+    return info;
+}
+
+class CanvasWidget final : public QWidget
+{
     Q_OBJECT
 public:
-    explicit LocalCanvasWidget(QWidget *parent = nullptr) : QWidget(parent)
+    explicit CanvasWidget(QWidget *parent = nullptr) : QWidget(parent)
     {
-        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAttribute(Qt::WA_OpaquePaintEvent, false);
         setMouseTracking(true);
-        setMinimumSize(420, 280);
-        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         setCursor(Qt::CrossCursor);
+        setMinimumSize(420, 280);
     }
 
-    void setZoom(double z)
-    {
-        m_zoom = qBound(0.25, z, 2.0);
-        update();
-    }
-
+    void setTool(Tool tool) { m_tool = tool; setCursor(tool == Tool::Text ? Qt::IBeamCursor : Qt::CrossCursor); }
+    void setZoom(double z) { m_zoom = qBound(0.25, z, 2.5); update(); }
     double zoom() const { return m_zoom; }
-
-    void setTool(HostTool tool)
-    {
-        m_tool = tool;
-        if (tool == HostTool::Text)
-            setCursor(Qt::IBeamCursor);
-        else
-            setCursor(Qt::CrossCursor);
-    }
-
-    HostTool tool() const { return m_tool; }
-    void setColor(const QColor &c) { g_penColor = c; }
-    void setStacks(std::vector<QImage> *u, std::vector<QImage> *r)
-    {
-        m_undo = u;
-        m_redo = r;
-    }
-
-    QSize sizeHint() const override { return QSize(960, 540); }
+    void setColor(const QColor &c) { Q_UNUSED(c); }
+    void refresh() { update(); }
 
 protected:
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(this);
-        p.setRenderHint(QPainter::Antialiasing, true);
-        QMutexLocker lock(&g_canvasMutex);
-
-        const QRectF target = canvasDisplayRect();
-        p.drawImage(target, g_canvas);
+        p.fillRect(rect(), QColor(26, 26, 30));
+        QRectF dst = canvasDisplayRect(this, m_zoom);
+        p.fillRect(dst, Qt::black);
+        QMutexLocker lock(&g_docMutex);
+        ensureDocument();
+        p.drawImage(dst, compositeDocument());
+        p.setPen(QPen(QColor(100, 100, 110), 1));
+        p.drawRect(dst);
     }
 
     void mousePressEvent(QMouseEvent *e) override
     {
-        if (e->button() != Qt::LeftButton || g_memberLocked)
+        if (e->button() != Qt::LeftButton)
             return;
-
-        QPoint p;
-        if (!mapWidgetToCanvas(e->position().toPoint(), p))
-            return;
-
-        if (m_tool == HostTool::Text) {
+        const QPoint p = canvasPointFromWidget(this, e->position(), m_zoom);
+        m_drawing = true;
+        m_start = p;
+        m_last = p;
+        if (m_tool == Tool::Text) {
+            m_drawing = false;
             bool ok = false;
-            const QString text = QInputDialog::getText(
-                this, QStringLiteral("Insert Text"), QStringLiteral("Text:"),
-                QLineEdit::Normal, QString(), &ok);
-
+            const QString text = QInputDialog::getText(this, "Insert Text", "Text:", QLineEdit::Normal, {}, &ok);
             if (ok && !text.isEmpty()) {
-                if (m_undo)
-                    pushCanvasSnapshot(*m_undo, *m_redo);
-
-                QMutexLocker lock(&g_canvasMutex);
-                QPainter painter(&g_canvas);
-                painter.setRenderHint(QPainter::TextAntialiasing, true);
-                QFont f;
-                f.setPixelSize(qMax(16, g_brushSize * 3));
-                painter.setFont(f);
-                painter.setPen(g_penColor);
-                painter.drawText(p, text);
-                ++g_canvasRevision;
+                snapshotPush();
+                drawTextAt(p, text);
                 update();
             }
             return;
         }
-
-        if (m_undo)
-            pushCanvasSnapshot(*m_undo, *m_redo);
-
-        g_drawing = true;
-        g_lastPoint = p;
-        g_shapeStart = p;
-
-        if (m_tool == HostTool::Pen || m_tool == HostTool::Eraser) {
-            QPen pen(
-                m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
-                m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
-                Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-
-            drawLineOnCanvas(
-                p, p, pen,
-                m_tool == HostTool::Eraser
-                    ? QPainter::CompositionMode_Clear
-                    : QPainter::CompositionMode_SourceOver);
+        snapshotPush();
+        if (m_tool == Tool::Pen || m_tool == Tool::Eraser) {
+            drawFreehand(p, p, m_tool == Tool::Eraser);
             update();
         }
     }
 
     void mouseMoveEvent(QMouseEvent *e) override
     {
-        if (!g_drawing || g_memberLocked)
+        if (!m_drawing)
             return;
-
-        QPoint p;
-        if (!mapWidgetToCanvas(e->position().toPoint(), p))
-            return;
-
-        if (m_tool == HostTool::Pen || m_tool == HostTool::Eraser) {
-            QPen pen(
-                m_tool == HostTool::Eraser ? Qt::transparent : g_penColor,
-                m_tool == HostTool::Eraser ? g_eraserSize : g_brushSize,
-                Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-
-            drawLineOnCanvas(
-                g_lastPoint, p, pen,
-                m_tool == HostTool::Eraser
-                    ? QPainter::CompositionMode_Clear
-                    : QPainter::CompositionMode_SourceOver);
-
-            g_lastPoint = p;
+        const QPoint p = canvasPointFromWidget(this, e->position(), m_zoom);
+        if (m_tool == Tool::Pen || m_tool == Tool::Eraser) {
+            drawFreehand(m_last, p, m_tool == Tool::Eraser);
+            m_last = p;
+            update();
+        } else {
+            // Shape preview is kept simple for this first V2 test build.
             update();
         }
     }
 
     void mouseReleaseEvent(QMouseEvent *e) override
     {
-        if (e->button() != Qt::LeftButton || !g_drawing)
+        if (e->button() != Qt::LeftButton || !m_drawing)
             return;
-
-        QPoint p;
-        if (!mapWidgetToCanvas(e->position().toPoint(), p)) {
-            g_drawing = false;
-            update();
-            return;
-        }
-
-        if (m_tool != HostTool::Pen && m_tool != HostTool::Eraser)
-            drawShapeOnCanvas(g_shapeStart, p, m_tool);
-
-        g_drawing = false;
+        const QPoint p = canvasPointFromWidget(this, e->position(), m_zoom);
+        if (m_tool != Tool::Pen && m_tool != Tool::Eraser)
+            drawShape(m_start, p, m_tool);
+        m_drawing = false;
         update();
     }
 
 private:
-    HostTool m_tool = HostTool::Pen;
+    Tool m_tool = Tool::Pen;
     double m_zoom = 1.0;
-    std::vector<QImage> *m_undo = nullptr;
-    std::vector<QImage> *m_redo = nullptr;
-
-    QRectF canvasDisplayRect() const
-    {
-        if (width() <= 0 || height() <= 0)
-            return QRectF();
-
-        constexpr double aspect = 1920.0 / 1080.0;
-        double w = width();
-        double h = w / aspect;
-
-        if (h > height()) {
-            h = height();
-            w = h * aspect;
-        }
-
-        w *= m_zoom;
-        h *= m_zoom;
-
-        return QRectF(
-            (width() - w) * 0.5,
-            (height() - h) * 0.5,
-            w, h);
-    }
-
-    bool mapWidgetToCanvas(const QPoint &point, QPoint &out) const
-    {
-        const QRectF rect = canvasDisplayRect();
-        if (!rect.contains(QPointF(point)))
-            return false;
-
-        const double nx = (point.x() - rect.left()) / rect.width();
-        const double ny = (point.y() - rect.top()) / rect.height();
-
-        out.setX(qBound(0, qRound(nx * 1919.0), 1919));
-        out.setY(qBound(0, qRound(ny * 1079.0), 1079));
-        return true;
-    }
+    QPoint m_start;
+    QPoint m_last;
+    bool m_drawing = false;
 };
 
-class HostDrawDialog final : public QDialog {
+class CanvasWindow final : public QDialog
+{
     Q_OBJECT
 public:
-    explicit HostDrawDialog(QWidget *parent = nullptr) : QDialog(parent)
+    explicit CanvasWindow(QWidget *parent = nullptr) : QDialog(parent)
     {
         setWindowTitle("VyanHQ Draw — Private Canvas");
-        resize(1100, 760);
+        resize(1180, 760);
+        setSizeGripEnabled(true);
+
         auto *root = new QVBoxLayout(this);
-        root->setContentsMargins(8,8,8,8);
+        root->setContentsMargins(8, 8, 8, 8);
         root->setSpacing(6);
-        auto *toolbar = new QHBoxLayout();
-        addTool(toolbar, "Pen", HostTool::Pen);
-        addTool(toolbar, "Eraser", HostTool::Eraser);
-        addTool(toolbar, "Line", HostTool::Line);
-        addTool(toolbar, "Rect", HostTool::Rectangle);
-        addTool(toolbar, "Circle", HostTool::Ellipse);
-        addTool(toolbar, "Arrow", HostTool::Arrow);
-        addTool(toolbar, "Text", HostTool::Text);
-        auto *colorBtn = new QPushButton("Color"); toolbar->addWidget(colorBtn);
-        auto *brushLabel = new QLabel("Brush"); toolbar->addWidget(brushLabel);
-        auto *brush = new QSlider(Qt::Horizontal); brush->setRange(1,80); brush->setValue(g_brushSize); toolbar->addWidget(brush,2);
-        auto *eraseLabel = new QLabel("Eraser"); toolbar->addWidget(eraseLabel);
-        auto *eraser = new QSlider(Qt::Horizontal); eraser->setRange(4,160); eraser->setValue(g_eraserSize); toolbar->addWidget(eraser,2);
-        auto *undoBtn = new QPushButton("Undo"); auto *redoBtn = new QPushButton("Redo"); auto *clearBtn = new QPushButton("Clear");
-        toolbar->addWidget(undoBtn); toolbar->addWidget(redoBtn); toolbar->addWidget(clearBtn);
-        root->addLayout(toolbar);
+
+        auto *tools = new QHBoxLayout();
+        const QList<QPair<QString, Tool>> buttons = {
+            {"Pen", Tool::Pen}, {"Eraser", Tool::Eraser}, {"Line", Tool::Line},
+            {"Rect", Tool::Rect}, {"Circle", Tool::Ellipse}, {"Arrow", Tool::Arrow}, {"Text", Tool::Text}
+        };
+        for (const auto &pair : buttons) {
+            auto *b = new QPushButton(pair.first);
+            b->setCheckable(true);
+            if (pair.second == Tool::Pen) b->setChecked(true);
+            tools->addWidget(b, 1);
+            connect(b, &QPushButton::clicked, this, [this, tool = pair.second, b, tools]() {
+                canvas->setTool(tool);
+                for (QObject *obj : tools->parent()->children()) Q_UNUSED(obj);
+            });
+        }
+
+        auto *color = new QPushButton("Color");
+        tools->addWidget(color, 1);
+        connect(color, &QPushButton::clicked, this, [this]() {
+            const QColor c = QColorDialog::getColor(g_color, this, "Drawing Color");
+            if (c.isValid()) g_color = c;
+        });
+
+        auto *brushText = new QLabel("Brush"); tools->addWidget(brushText);
+        auto *brush = new QSlider(Qt::Horizontal); brush->setRange(1, 80); brush->setValue(g_brush); tools->addWidget(brush, 2);
+        auto *eraserText = new QLabel("Eraser"); tools->addWidget(eraserText);
+        auto *eraser = new QSlider(Qt::Horizontal); eraser->setRange(4, 160); eraser->setValue(g_eraser); tools->addWidget(eraser, 2);
+        auto *undo = new QPushButton("Undo"); tools->addWidget(undo, 1);
+        auto *redo = new QPushButton("Redo"); tools->addWidget(redo, 1);
+        auto *clear = new QPushButton("Clear"); tools->addWidget(clear, 1);
+        root->addLayout(tools);
 
         auto *zoomRow = new QHBoxLayout();
         zoomRow->addWidget(new QLabel("Zoom"));
-        zoom = new QSlider(Qt::Horizontal); zoom->setRange(25,250); zoom->setValue(100); zoomRow->addWidget(zoom,1);
+        zoom = new QSlider(Qt::Horizontal); zoom->setRange(25, 250); zoom->setValue(100); zoomRow->addWidget(zoom, 2);
         zoomLabel = new QLabel("100%"); zoomRow->addWidget(zoomLabel);
         root->addLayout(zoomRow);
 
-        canvas = new LocalCanvasWidget(this); canvas->setStacks(&undo, &redo);
-        root->addWidget(canvas,1);
+        auto *body = new QHBoxLayout();
+        canvas = new CanvasWidget(this);
+        body->addWidget(canvas, 1);
 
-        connect(colorBtn,&QPushButton::clicked,this,[this]{ const QColor c=QColorDialog::getColor(g_penColor,this,"Choose drawing color"); if(c.isValid()){g_penColor=c;canvas->setColor(c);} });
-        connect(brush,&QSlider::valueChanged,this,[](int v){g_brushSize=v;});
-        connect(eraser,&QSlider::valueChanged,this,[](int v){g_eraserSize=v;});
-        connect(clearBtn,&QPushButton::clicked,this,[this]{ pushCanvasSnapshot(undo,redo); clearPrivateCanvas(); canvas->update(); });
-        connect(undoBtn,&QPushButton::clicked,this,[this]{ if(undo.empty())return; {QMutexLocker lock(&g_canvasMutex); redo.push_back(g_canvas);} restoreCanvasFrom(undo.back()); undo.pop_back(); canvas->update(); });
-        connect(redoBtn,&QPushButton::clicked,this,[this]{ if(redo.empty())return; {QMutexLocker lock(&g_canvasMutex); undo.push_back(g_canvas);} restoreCanvasFrom(redo.back()); redo.pop_back(); canvas->update(); });
-        connect(zoom,&QSlider::valueChanged,this,[this](int v){double z=v/100.0;zoomLabel->setText(QString::number(v)+"%");canvas->setZoom(z);});
+        auto *layers = new QVBoxLayout();
+        layers->addWidget(new QLabel("Layers"));
+        layerList = new QListWidget();
+        layers->addWidget(layerList, 1);
+        auto *layerBtns = new QHBoxLayout();
+        auto *add = new QPushButton("+"); auto *remove = new QPushButton("-");
+        layerBtns->addWidget(add); layerBtns->addWidget(remove); layers->addLayout(layerBtns);
+        QWidget *layerPanel = new QWidget(); layerPanel->setLayout(layers); layerPanel->setMinimumWidth(190);
+        body->addWidget(layerPanel);
+        root->addLayout(body, 1);
+
+        connect(brush, &QSlider::valueChanged, this, [](int v) { g_brush = v; });
+        connect(eraser, &QSlider::valueChanged, this, [](int v) { g_eraser = v; });
+        connect(zoom, &QSlider::valueChanged, this, [this](int v) { zoomLabel->setText(QString::number(v) + "%"); canvas->setZoom(v / 100.0); });
+        connect(clear, &QPushButton::clicked, this, [this] { snapshotPush(); clearMyCanvas(); canvas->refresh(); syncLayers(); });
+        connect(undo, &QPushButton::clicked, this, [this] { performUndo(); });
+        connect(redo, &QPushButton::clicked, this, [this] { performRedo(); });
+        connect(add, &QPushButton::clicked, this, [this] { addLayer(); });
+        connect(remove, &QPushButton::clicked, this, [this] { removeLayer(); });
+        connect(layerList, &QListWidget::currentRowChanged, this, [this](int row) {
+            if (row >= 0 && row < (int)g_layers.size()) { g_activeLayer = row; canvas->refresh(); }
+        });
+
+        syncLayers();
     }
+
 private:
-    LocalCanvasWidget *canvas = nullptr;
+    CanvasWidget *canvas = nullptr;
+    QListWidget *layerList = nullptr;
     QSlider *zoom = nullptr;
     QLabel *zoomLabel = nullptr;
-    std::vector<QImage> undo, redo;
-    void addTool(QHBoxLayout *bar, const QString &name, HostTool tool) {
-        auto *b = new QPushButton(name); b->setCheckable(true); b->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred); bar->addWidget(b);
-        if(tool==HostTool::Pen) b->setChecked(true);
-        connect(b,&QPushButton::clicked,this,[this,tool,b,bar]{ canvas->setTool(tool); for(auto *w: bar->parentWidget()->findChildren<QPushButton*>()){ if(w!=b && w->text()!=QChar(0)){} } });
+
+    void syncLayers()
+    {
+        QMutexLocker lock(&g_docMutex);
+        ensureDocument();
+        layerList->clear();
+        for (const Layer &l : g_layers) layerList->addItem(l.name);
+        if (!g_layers.empty()) layerList->setCurrentRow(g_activeLayer);
+    }
+
+    void addLayer()
+    {
+        snapshotPush();
+        QMutexLocker lock(&g_docMutex);
+        Layer l;
+        l.name = QString("Layer %1").arg(g_layers.size() + 1);
+        l.image = QImage(kCanvasW, kCanvasH, QImage::Format_RGBA8888);
+        l.image.fill(Qt::transparent);
+        g_layers.push_back(std::move(l));
+        g_activeLayer = (int)g_layers.size() - 1;
+        touchDocument();
+        syncLayers();
+        canvas->refresh();
+    }
+
+    void removeLayer()
+    {
+        QMutexLocker lock(&g_docMutex);
+        if (g_layers.size() <= 1) return;
+        if (g_activeLayer < 0 || g_activeLayer >= (int)g_layers.size()) return;
+        lock.unlock();
+        snapshotPush();
+        lock.relock();
+        g_layers.erase(g_layers.begin() + g_activeLayer);
+        g_activeLayer = qBound(0, g_activeLayer, (int)g_layers.size() - 1);
+        touchDocument();
+        lock.unlock();
+        syncLayers();
+        canvas->refresh();
+    }
+
+    void performUndo()
+    {
+        if (g_undo.empty()) return;
+        Snapshot current;
+        {
+            QMutexLocker lock(&g_docMutex);
+            current.active = g_activeLayer;
+            current.layers = g_layers;
+            g_redo.push_back(current);
+            Snapshot target = g_undo.back();
+            g_undo.pop_back();
+            g_layers = target.layers;
+            g_activeLayer = target.active;
+            touchDocument();
+        }
+        syncLayers();
+        canvas->refresh();
+    }
+
+    void performRedo()
+    {
+        if (g_redo.empty()) return;
+        Snapshot current;
+        {
+            QMutexLocker lock(&g_docMutex);
+            current.active = g_activeLayer;
+            current.layers = g_layers;
+            g_undo.push_back(current);
+            Snapshot target = g_redo.back();
+            g_redo.pop_back();
+            g_layers = target.layers;
+            g_activeLayer = target.active;
+            touchDocument();
+        }
+        syncLayers();
+        canvas->refresh();
     }
 };
-
-static bool localCanvasSourceExists()
-{
-    obs_source_t *existing = obs_get_source_by_name("VyanHQ Draw");
-    if (!existing)
-        return false;
-
-    obs_source_release(existing);
-    return true;
-}
 
 static QString trimBase(QString s)
 {
@@ -452,391 +568,310 @@ static QString trimBase(QString s)
     return s;
 }
 
-class VyanDock final : public QWidget {
+class VyanDock final : public QWidget
+{
     Q_OBJECT
 public:
-    explicit VyanDock(QWidget *parent = nullptr) : QWidget(parent), settings("VyanHQ", "VyanHQ Draw")
+    explicit VyanDock(QWidget *parent = nullptr) : QWidget(parent), settings("VyanHQ", "VyanHQ Draw V2")
     {
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        setMinimumSize(170, 140);
+        setMinimumSize(180, 150);
         auto *root = new QVBoxLayout(this);
         root->setContentsMargins(8, 8, 8, 8);
-        root->setSpacing(5);
-
-        auto *title = new QLabel("<b style='font-size:14px'>VyanHQ Draw</b>");
-        root->addWidget(title);
-        statusLabel = new QLabel("Disconnected");
-        root->addWidget(statusLabel);
+        root->setSpacing(6);
+        auto *title = new QLabel("<b style='font-size:14px'>VyanHQ Draw</b>"); root->addWidget(title);
+        status = new QLabel("Disconnected"); status->setStyleSheet("font-size:10px;color:#a0a0a0;"); root->addWidget(status);
 
         auto *r1 = new QHBoxLayout();
-        drawBtn = new QPushButton("Draw");
-        profileBtn = new QPushButton(QString::fromUtf8("◉"));
-        profileBtn->setToolTip("Copy member link");
-        drawBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        profileBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        r1->addWidget(drawBtn, 4); r1->addWidget(profileBtn, 1); root->addLayout(r1, 3);
+        draw = new QPushButton("DRAW"); profile = new QPushButton(QString::fromUtf8("◯")); profile->setToolTip("Copy member link");
+        draw->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        profile->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        r1->addWidget(draw, 4); r1->addWidget(profile, 1); root->addLayout(r1, 1);
 
         auto *r2 = new QHBoxLayout();
-        connectBtn = new QPushButton("Connect");
-        forgetBtn = new QPushButton("Forget");
+        connectBtn = new QPushButton("CONNECT"); forget = new QPushButton("FORGET");
         connectBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        forgetBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        r2->addWidget(connectBtn); r2->addWidget(forgetBtn); root->addLayout(r2, 2);
+        forget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        r2->addWidget(connectBtn); r2->addWidget(forget); root->addLayout(r2, 1);
 
-        connect(drawBtn, &QPushButton::clicked, this, &VyanDock::drawClicked);
-        connect(profileBtn, &QPushButton::clicked, this, &VyanDock::copyMemberLink);
+        connect(draw, &QPushButton::clicked, this, &VyanDock::drawClicked);
+        connect(profile, &QPushButton::clicked, this, &VyanDock::copyMemberLink);
         connect(connectBtn, &QPushButton::clicked, this, &VyanDock::connectClicked);
-        connect(forgetBtn, &QPushButton::clicked, this, &VyanDock::forgetRoom);
-        loadState();
+        connect(forget, &QPushButton::clicked, this, &VyanDock::forgetRoom);
+        refreshStatus();
     }
 
-    void doControl(const QString &action) { control(action); }
-    void toggleOverlay() { g_canvasVisible = !g_canvasVisible; refreshStatus(); }
+    void doControl(const QString &action)
+    {
+        if (action == "clear-mine") {
+            clearMyCanvas();
+            return;
+        }
+        if (action == "toggle") {
+            g_visible = !g_visible;
+            refreshStatus();
+        }
+    }
 
 private:
     QSettings settings;
     QNetworkAccessManager net;
-    QLabel *statusLabel = nullptr;
-    QPushButton *drawBtn = nullptr;
-    QPushButton *profileBtn = nullptr;
+    QLabel *status = nullptr;
+    QPushButton *draw = nullptr;
+    QPushButton *profile = nullptr;
     QPushButton *connectBtn = nullptr;
-    QPushButton *forgetBtn = nullptr;
-    QString server, room, roomName, hostToken, memberToken, canvasName;
-    bool memberRoomActive = false;
-    bool canvasExists = false;
+    QPushButton *forget = nullptr;
+    QString backend, room, memberToken, hostToken, roomName;
 
-    void setStatus(const QString &text, bool good) {
-        statusLabel->setText(text);
-        statusLabel->setStyleSheet(good ? "color:#65d995;font-size:10px;" : "color:#f0ad4e;font-size:10px;");
+    void setStatus(const QString &s, bool good = true)
+    {
+        status->setText(s);
+        status->setStyleSheet(good ? "font-size:10px;color:#65d995;" : "font-size:10px;color:#f0ad4e;");
     }
-    QString backend() const { return trimBase(server); }
-    void loadState() {
-        server=settings.value("server").toString();
-        room=settings.value("room").toString(); roomName=settings.value("roomName").toString();
-        hostToken=settings.value("hostToken").toString(); memberToken=settings.value("memberToken").toString();
-        canvasName=settings.value("canvasName").toString(); canvasExists=localCanvasSourceExists();
-        memberRoomActive=!room.isEmpty()&&!hostToken.isEmpty()&&!memberToken.isEmpty();
-        refreshStatus();
+
+    void refreshStatus()
+    {
+        if (!g_visible) { setStatus("Locked", true); return; }
+        if (settings.value("room").toString().isEmpty() && !settings.value("backend").toString().isEmpty()) { setStatus("Connected", true); return; }
+        if (!settings.value("room").toString().isEmpty()) { setStatus("Room Active", true); return; }
+        setStatus("Disconnected", false);
     }
-    void refreshStatus() {
-        if (g_memberLocked && memberRoomActive) setStatus("Locked", true);
-        else if (canvasExists && g_canvasVisible) setStatus("Canvas Active", true);
-        else if (memberRoomActive) setStatus("Room Active", true);
-        else if (!backend().isEmpty()) setStatus("Connected", true);
-        else setStatus("Disconnected", false);
+
+    bool backendConfigured()
+    {
+        backend = trimBase(settings.value("backend").toString());
+        if (backend.isEmpty()) {
+            QDialog dlg(this); dlg.setWindowTitle("Cloud Setup");
+            auto *l = new QVBoxLayout(&dlg);
+            l->addWidget(new QLabel("Cloudflare Worker URL"));
+            auto *e = new QLineEdit(); e->setPlaceholderText("https://your-worker.workers.dev"); l->addWidget(e);
+            auto *buttons = new QHBoxLayout(); auto *cancel = new QPushButton("Cancel"); auto *save = new QPushButton("Save"); buttons->addWidget(cancel); buttons->addWidget(save); l->addLayout(buttons);
+            connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+            connect(save, &QPushButton::clicked, &dlg, [&dlg, e, this]() { const QString v = trimBase(e->text()); if (v.isEmpty()) return; settings.setValue("backend", v); backend = v; dlg.accept(); });
+            if (dlg.exec() != QDialog::Accepted) return false;
+        }
+        return !backend.isEmpty();
     }
-    bool backendConfigured() {
-        if (backend().isEmpty() || backend().contains("your-worker", Qt::CaseInsensitive)) { showBackendDialog(); return false; }
-        settings.setValue("server", backend()); return true;
+
+    bool sourceInCurrentScene() const
+    {
+        obs_source_t *src = obs_get_source_by_name("VyanHQ Draw");
+        if (!src) return false;
+        bool found = false;
+        obs_source_t *sceneSrc = obs_frontend_get_current_scene();
+        if (sceneSrc) {
+            obs_scene_t *scene = obs_scene_from_source(sceneSrc);
+            if (scene) {
+                struct Ctx { obs_source_t *src; bool *found; } ctx{src, &found};
+                obs_scene_enum_items(scene, [](obs_scene_t*, obs_sceneitem_t *item, void *data) {
+                    auto *c = static_cast<Ctx *>(data);
+                    if (obs_sceneitem_get_source(item) == c->src) { *c->found = true; return false; }
+                    return true;
+                }, &ctx);
+            }
+            obs_source_release(sceneSrc);
+        }
+        obs_source_release(src);
+        return found;
     }
-    void showBackendDialog() {
-        QDialog dlg(this); dlg.setWindowTitle("Cloud Backend Setup"); auto *l=new QVBoxLayout(&dlg);
-        l->addWidget(new QLabel("Cloudflare Worker URL (set once for member rooms)"));
-        auto *e=new QLineEdit(server); e->setPlaceholderText("https://your-worker.workers.dev"); l->addWidget(e);
-        auto *r=new QHBoxLayout(); auto *c=new QPushButton("Cancel"); auto *s=new QPushButton("Save"); r->addWidget(c);r->addWidget(s);l->addLayout(r);
-        connect(c,&QPushButton::clicked,&dlg,&QDialog::reject);
-        connect(s,&QPushButton::clicked,&dlg,[this,&dlg,e](){QString v=trimBase(e->text());if(v.isEmpty())return;server=v;settings.setValue("server",server);dlg.accept();refreshStatus();});
-        dlg.exec();
+
+    void ensureLocalSource(const QString &canvasName)
+    {
+        const QString sourceName = canvasName.trimmed().isEmpty() ? QStringLiteral("VyanHQ Draw") : canvasName.trimmed();
+        settings.setValue("canvasName", sourceName);
+        obs_source_t *src = obs_get_source_by_name(sourceName.toUtf8().constData());
+        if (!src) {
+            obs_data_t *settingsObj = obs_data_create();
+            obs_source_t *created = obs_source_create("vyanhq_draw", sourceName.toUtf8().constData(), settingsObj, nullptr);
+            obs_data_release(settingsObj);
+            src = created;
+        }
+        obs_source_t *sceneSrc = obs_frontend_get_current_scene();
+        if (src && sceneSrc) {
+            obs_scene_t *scene = obs_scene_from_source(sceneSrc);
+            bool exists = false;
+            if (scene) {
+                struct Ctx { obs_source_t *src; bool *exists; } ctx{src, &exists};
+                obs_scene_enum_items(scene, [](obs_scene_t*, obs_sceneitem_t *item, void *data) {
+                    auto *c = static_cast<Ctx *>(data);
+                    if (obs_sceneitem_get_source(item) == c->src) { *c->exists = true; return false; }
+                    return true;
+                }, &ctx);
+                if (!exists) {
+                    obs_sceneitem_t *item = obs_scene_add(scene, src);
+                    if (item) {
+                        obs_sceneitem_set_pos(item, vec2{0.0f, 0.0f});
+                        obs_sceneitem_set_scale(item, vec2{1.0f, 1.0f});
+                        obs_sceneitem_set_visible(item, true);
+                    }
+                }
+            }
+            obs_source_release(sceneSrc);
+        }
+        if (src) obs_source_release(src);
+        Q_UNUSED(sceneSrc);
     }
-    void connectClicked() {
-        if(!backendConfigured()) return;
-        if(memberRoomActive){ setStatus("Room Active", true); return; }
-        QDialog dlg(this); dlg.setWindowTitle("Create Member Room"); auto *l=new QVBoxLayout(&dlg);
-        l->addWidget(new QLabel("Room name")); auto *n=new QLineEdit(); n->setPlaceholderText("VyanHQ Live Draw"); l->addWidget(n);
-        auto *r=new QHBoxLayout(); auto *c=new QPushButton("Cancel"); auto *make=new QPushButton("Create"); r->addWidget(c);r->addWidget(make);l->addLayout(r);
-        connect(c,&QPushButton::clicked,&dlg,&QDialog::reject);
-        connect(make,&QPushButton::clicked,&dlg,[this,&dlg,n](){
-            QString name=n->text().trimmed(); if(name.isEmpty())name="VyanHQ Live Draw";
-            connectBtn->setEnabled(false); setStatus("Connecting…",false);
-            QNetworkRequest req(QUrl(backend()+"/api/room/new")); req.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
-            auto *reply=net.post(req,QJsonDocument(QJsonObject{{"name",name}}).toJson(QJsonDocument::Compact));
-            connect(reply,&QNetworkReply::finished,this,[this,reply,&dlg,name](){
-                auto err=reply->error(); auto status=reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(); auto raw=reply->readAll(); reply->deleteLater(); connectBtn->setEnabled(true);
-                if(err!=QNetworkReply::NoError||status>=400){refreshStatus();QMessageBox::warning(this,"VyanHQ Draw","Could not create member room.");return;}
-                QJsonParseError pe{};auto doc=QJsonDocument::fromJson(raw,&pe);if(pe.error!=QJsonParseError::NoError||!doc.isObject()){QMessageBox::warning(this,"VyanHQ Draw","Invalid Worker response.");return;}
-                auto o=doc.object();room=o.value("room").toString();roomName=o.value("name").toString(name);hostToken=o.value("hostToken").toString();memberToken=o.value("memberToken").toString();memberRoomActive=true;
-                settings.setValue("room",room);settings.setValue("roomName",roomName);settings.setValue("hostToken",hostToken);settings.setValue("memberToken",memberToken);
-                QApplication::clipboard()->setText(makeMemberUrl()); createMemberOverlaySource(); refreshStatus(); dlg.accept();
-                QMessageBox::information(this,"VyanHQ Draw","Member room created. The member link was copied to the clipboard.");
+
+    void drawClicked()
+    {
+        const QString savedName = settings.value("canvasName", "VyanHQ Draw").toString();
+        const bool exists = [&]() {
+            obs_source_t *src = obs_get_source_by_name(savedName.toUtf8().constData());
+            if (!src) return false;
+            bool found = false;
+            obs_source_t *sceneSrc = obs_frontend_get_current_scene();
+            if (sceneSrc) {
+                obs_scene_t *scene = obs_scene_from_source(sceneSrc);
+                if (scene) {
+                    struct Ctx { obs_source_t *src; bool *found; } ctx{src, &found};
+                    obs_scene_enum_items(scene, [](obs_scene_t*, obs_sceneitem_t *item, void *data) {
+                        auto *c = static_cast<Ctx *>(data);
+                        if (obs_sceneitem_get_source(item) == c->src) { *c->found = true; return false; }
+                        return true;
+                    }, &ctx);
+                }
+                obs_source_release(sceneSrc);
+            }
+            obs_source_release(src);
+            return found;
+        }();
+        if (!exists) {
+            QDialog dlg(this); dlg.setWindowTitle("Create Canvas");
+            auto *l = new QVBoxLayout(&dlg);
+            l->addWidget(new QLabel("Canvas name"));
+            auto *name = new QLineEdit(); name->setPlaceholderText("VyanHQ Draw"); l->addWidget(name);
+            l->addWidget(new QLabel("Private 1920×1080 native OBS canvas. No cloud room is required."));
+            auto *buttons = new QHBoxLayout(); auto *cancel = new QPushButton("Cancel"); auto *create = new QPushButton("Create"); buttons->addWidget(cancel); buttons->addWidget(create); l->addLayout(buttons);
+            connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+            connect(create, &QPushButton::clicked, &dlg, [&dlg, name, this]() {
+                ensureDocument();
+                ensureLocalSource(name->text().trimmed().isEmpty() ? QStringLiteral("VyanHQ Draw") : name->text().trimmed());
+                dlg.accept();
+            });
+            if (dlg.exec() != QDialog::Accepted) return;
+        } else {
+            ensureLocalSource(savedName);
+        }
+
+        auto *window = new CanvasWindow(nullptr);
+        window->setAttribute(Qt::WA_DeleteOnClose, true);
+        window->show(); window->raise(); window->activateWindow();
+        g_visible = true;
+        setStatus("Canvas Active");
+    }
+
+    void connectClicked()
+    {
+        if (!backendConfigured()) return;
+        if (!settings.value("room").toString().isEmpty()) { setStatus("Room Active"); return; }
+
+        QDialog dlg(this); dlg.setWindowTitle("Create Member Room");
+        auto *l = new QVBoxLayout(&dlg);
+        l->addWidget(new QLabel("Room name"));
+        auto *name = new QLineEdit(); name->setPlaceholderText("VyanHQ Live Draw"); l->addWidget(name);
+        auto *buttons = new QHBoxLayout(); auto *cancel = new QPushButton("Cancel"); auto *create = new QPushButton("Create"); buttons->addWidget(cancel); buttons->addWidget(create); l->addLayout(buttons);
+        connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+        connect(create, &QPushButton::clicked, &dlg, [this, &dlg, name]() {
+            QNetworkRequest req(QUrl(backend + "/api/room/new"));
+            req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+            const QString roomNameText = name->text().trimmed().isEmpty() ? QStringLiteral("VyanHQ Live Draw") : name->text().trimmed();
+            auto *reply = net.post(req, QJsonDocument(QJsonObject{{"name", roomNameText}}).toJson(QJsonDocument::Compact));
+            connect(reply, &QNetworkReply::finished, this, [this, reply, &dlg, roomNameText]() {
+                const auto err = reply->error();
+                const auto http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                const auto raw = reply->readAll(); reply->deleteLater();
+                if (err != QNetworkReply::NoError || http >= 400) { QMessageBox::warning(this, "VyanHQ Draw", "Could not create member room yet."); return; }
+                QJsonParseError pe{}; const auto doc = QJsonDocument::fromJson(raw, &pe);
+                if (pe.error != QJsonParseError::NoError || !doc.isObject()) { QMessageBox::warning(this, "VyanHQ Draw", "Invalid room response."); return; }
+                const auto o = doc.object();
+                settings.setValue("room", o.value("room").toString());
+                settings.setValue("roomName", o.value("name").toString(roomNameText));
+                settings.setValue("hostToken", o.value("hostToken").toString());
+                settings.setValue("memberToken", o.value("memberToken").toString());
+                hostToken = o.value("hostToken").toString(); memberToken = o.value("memberToken").toString(); room = o.value("room").toString();
+                QUrl member(backend + "/member"); QUrlQuery q; q.addQueryItem("room", room); q.addQueryItem("token", memberToken); member.setQuery(q);
+                QApplication::clipboard()->setText(member.toString());
+                setStatus("Room Active"); dlg.accept();
+                QMessageBox::information(this, "VyanHQ Draw", "Member link copied to clipboard.");
             });
         });
         dlg.exec();
     }
-    void forgetRoom(){
-        room.clear();roomName.clear();hostToken.clear();memberToken.clear();memberRoomActive=false;
-        settings.remove("room");settings.remove("roomName");settings.remove("hostToken");settings.remove("memberToken");
-        removeMemberOverlaySource(); refreshStatus();
-    }
-    QString makeMemberUrl() const { QUrl u(backend()+"/member");QUrlQuery q;q.addQueryItem("room",room);q.addQueryItem("token",memberToken);u.setQuery(q);return u.toString(); }
-    QString makeMemberOverlayUrl() const { QUrl u(backend()+"/overlay");QUrlQuery q;q.addQueryItem("room",room);q.addQueryItem("token",hostToken);q.addQueryItem("role","overlay");u.setQuery(q);return u.toString(); }
-    void copyMemberLink(){ if(!memberRoomActive){QMessageBox::information(this,"VyanHQ Draw","Create a member room with Connect first.");return;}QApplication::clipboard()->setText(makeMemberUrl()); }
 
-    void drawClicked()
+    void copyMemberLink()
     {
-        // Use the actual OBS source as the source of truth. A stale saved
-        // boolean must never suppress the Create Canvas dialog.
-        canvasExists = localCanvasSourceExists();
-
-        if (!canvasExists) {
-            QDialog dlg(this);
-            dlg.setWindowTitle("Create Canvas");
-
-            auto *l = new QVBoxLayout(&dlg);
-            l->setContentsMargins(12, 12, 12, 12);
-            l->setSpacing(8);
-
-            l->addWidget(new QLabel("Canvas name"));
-
-            auto *e = new QLineEdit(canvasName);
-            e->setPlaceholderText("VyanHQ Draw");
-            e->setClearButtonEnabled(true);
-            l->addWidget(e);
-
-            auto *sizeInfo = new QLabel(
-                "OBS overlay size: 1920 × 1080");
-            sizeInfo->setStyleSheet("color:#8f8f9b;font-size:10px;");
-            l->addWidget(sizeInfo);
-
-            auto *hint = new QLabel(
-                "Private canvas for your own drawing. "
-                "No Cloudflare or member room is required.");
-            hint->setWordWrap(true);
-            hint->setStyleSheet("color:#8f8f9b;font-size:10px;");
-            l->addWidget(hint);
-
-            auto *r = new QHBoxLayout();
-            auto *c = new QPushButton("Cancel");
-            auto *make = new QPushButton("Create");
-            make->setDefault(true);
-            r->addStretch();
-            r->addWidget(c);
-            r->addWidget(make);
-            l->addLayout(r);
-
-            connect(c, &QPushButton::clicked, &dlg, &QDialog::reject);
-            connect(make, &QPushButton::clicked, &dlg,
-                    [this, &dlg, e]() {
-                        QString name = e->text().trimmed();
-                        if (name.isEmpty())
-                            name = "VyanHQ Draw";
-
-                        canvasName = name;
-                        settings.setValue("canvasName", canvasName);
-
-                        if (!createLocalObsSource()) {
-                            QMessageBox::warning(
-                                this, "VyanHQ Draw",
-                                "Could not create the VyanHQ Draw source "
-                                "in the active OBS scene.");
-                            return;
-                        }
-
-                        canvasExists = true;
-                        settings.setValue("canvasExists", true);
-                        dlg.accept();
-                    });
-
-            dlg.exec();
-
-            if (!canvasExists)
-                return;
-        }
-
-        if (createLocalObsSource()) {
-            auto *host = new HostDrawDialog(this);
-            host->setAttribute(Qt::WA_DeleteOnClose, true);
-            host->show();
-            host->raise();
-            host->activateWindow();
-            g_canvasVisible = true;
-            setStatus("Canvas Active", true);
-        }
+        const QString backendUrl = trimBase(settings.value("backend").toString());
+        const QString roomId = settings.value("room").toString();
+        const QString token = settings.value("memberToken").toString();
+        if (backendUrl.isEmpty() || roomId.isEmpty() || token.isEmpty()) { QMessageBox::information(this, "VyanHQ Draw", "Create a member room with CONNECT first."); return; }
+        QUrl u(backendUrl + "/member"); QUrlQuery q; q.addQueryItem("room", roomId); q.addQueryItem("token", token); u.setQuery(q);
+        QApplication::clipboard()->setText(u.toString());
     }
 
-    bool createLocalObsSource()
+    void forgetRoom()
     {
-        const char *sourceName = "VyanHQ Draw";
-        obs_source_t *existing = obs_get_source_by_name(sourceName);
-
-        if (!existing) {
-            obs_data_t *d = obs_data_create();
-            obs_source_t *src =
-                obs_source_create("vyanhq_draw_local", sourceName, d, nullptr);
-            obs_data_release(d);
-
-            if (!src)
-                return false;
-
-            obs_source_t *current = obs_frontend_get_current_scene();
-            if (!current) {
-                obs_source_release(src);
-                return false;
-            }
-
-            obs_scene_t *scene = obs_scene_from_source(current);
-            if (!scene) {
-                obs_source_release(current);
-                obs_source_release(src);
-                return false;
-            }
-
-            obs_sceneitem_t *item = obs_scene_add(scene, src);
-            if (!item) {
-                obs_source_release(current);
-                obs_source_release(src);
-                return false;
-            }
-
-            obs_sceneitem_set_visible(item, true);
-            obs_sceneitem_set_locked(item, false);
-
-            struct vec2 pos = {0.0f, 0.0f};
-            struct vec2 scale = {1.0f, 1.0f};
-            obs_sceneitem_set_pos(item, &pos);
-            obs_sceneitem_set_scale(item, &scale);
-            obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
-
-            obs_source_set_enabled(src, true);
-
-            obs_source_release(current);
-            obs_source_release(src);
-        } else {
-            obs_source_set_enabled(existing, true);
-
-            bool inCurrentScene = false;
-            obs_source_t *current = obs_frontend_get_current_scene();
-
-            if (current) {
-                obs_scene_t *scene = obs_scene_from_source(current);
-                if (scene) {
-                    struct FindCtx {
-                        obs_source_t *target;
-                        bool found;
-                    } ctx{existing, false};
-
-                    obs_scene_enum_items(
-                        scene,
-                        [](obs_scene_t *, obs_sceneitem_t *item, void *data) {
-                            auto *ctx = static_cast<FindCtx *>(data);
-                            if (obs_sceneitem_get_source(item) == ctx->target) {
-                                ctx->found = true;
-                                obs_sceneitem_set_visible(item, true);
-                                obs_sceneitem_set_locked(item, false);
-
-                                struct vec2 pos = {0.0f, 0.0f};
-                                struct vec2 scale = {1.0f, 1.0f};
-                                obs_sceneitem_set_pos(item, &pos);
-                                obs_sceneitem_set_scale(item, &scale);
-                                obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
-                                return false;
-                            }
-                            return true;
-                        },
-                        &ctx);
-
-                    inCurrentScene = ctx.found;
-                    if (!inCurrentScene) {
-                        obs_sceneitem_t *item = obs_scene_add(scene, existing);
-                        if (item) {
-                            obs_sceneitem_set_visible(item, true);
-                            obs_sceneitem_set_locked(item, false);
-
-                            struct vec2 pos = {0.0f, 0.0f};
-                            struct vec2 scale = {1.0f, 1.0f};
-                            obs_sceneitem_set_pos(item, &pos);
-                            obs_sceneitem_set_scale(item, &scale);
-                            obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
-                            inCurrentScene = true;
-                        }
-                    }
-                }
-                obs_source_release(current);
-            }
-
-            obs_source_release(existing);
-            if (!inCurrentScene)
-                return false;
-        }
-
-        g_canvasVisible = true;
-        return true;
-    }
-
-    void createMemberOverlaySource(){
-        if(!memberRoomActive)return;
-        const QString url=makeMemberOverlayUrl();
-        obs_source_t *current=obs_frontend_get_current_scene();if(!current)return;
-        obs_scene_t *scene=obs_scene_from_source(current);if(!scene){obs_source_release(current);return;}
-        const char *name="VyanHQ Member Overlay";
-        obs_source_t *existing=obs_get_source_by_name(name);
-        if(existing){obs_data_t*d=obs_source_get_settings(existing);obs_data_set_string(d,"url",url.toUtf8().constData());obs_data_set_int(d,"width",1920);obs_data_set_int(d,"height",1080);obs_data_set_int(d,"fps",60);obs_source_update(existing,d);obs_data_release(d);obs_source_release(existing);obs_source_release(current);return;}
-        obs_data_t*d=obs_data_create();obs_data_set_string(d,"url",url.toUtf8().constData());obs_data_set_int(d,"width",1920);obs_data_set_int(d,"height",1080);obs_data_set_int(d,"fps",60);
-        obs_source_t*browser=obs_source_create("browser_source",name,d,nullptr);obs_data_release(d);if(browser){obs_scene_add(scene,browser);obs_source_release(browser);}obs_source_release(current);
-    }
-    void removeMemberOverlaySource(){
-        obs_source_t *s=obs_get_source_by_name("VyanHQ Member Overlay");if(!s)return;
-        obs_source_t *current=obs_frontend_get_current_scene();if(!current){obs_source_release(s);return;}obs_scene_t*scene=obs_scene_from_source(current);if(scene){
-            struct Ctx{obs_source_t*target;};Ctx ctx{s};
-            obs_scene_enum_items(scene,[](obs_scene_t*,obs_sceneitem_t*item,void*data){auto*c=static_cast<Ctx*>(data);if(obs_sceneitem_get_source(item)==c->target){obs_sceneitem_remove(item);return false;}return true;},&ctx);
-        }obs_source_release(s);obs_source_release(current);
-    }
-    void control(const QString &action){
-        if(action=="clear-mine"){clearPrivateCanvas();return;}
-        if(action=="toggle"){g_canvasVisible=!g_canvasVisible;refreshStatus();return;}
-        if(!memberRoomActive||!backendConfigured())return;
-        QNetworkRequest req(QUrl(backend()+"/api/control"));req.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
-        auto *reply=net.post(req,QJsonDocument(QJsonObject{{"room",room},{"hostToken",hostToken},{"action",action}}).toJson(QJsonDocument::Compact));
-        connect(reply,&QNetworkReply::finished,this,[this,reply,action](){auto err=reply->error();auto status=reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();reply->deleteLater();if(err!=QNetworkReply::NoError||status>=400){setStatus("Control Failed",false);return;}if(action=="lock"){g_memberLocked=true;setStatus("Locked",true);}else if(action=="unlock"){g_memberLocked=false;refreshStatus();}else if(action=="clear-members"){refreshStatus();}});
+        settings.remove("room"); settings.remove("roomName"); settings.remove("hostToken"); settings.remove("memberToken");
+        refreshStatus();
     }
 };
 
-static void hkClearMembers(void *,obs_hotkey_id,obs_hotkey_t *,bool pressed){if(pressed&&g_ui)g_ui->doControl("clear-members");}
-static void hkClearMine(void *,obs_hotkey_id,obs_hotkey_t *,bool pressed){if(pressed&&g_ui)g_ui->doControl("clear-mine");}
-static void hkLock(void *,obs_hotkey_id,obs_hotkey_t *,bool pressed){if(pressed&&g_ui)g_ui->doControl("lock");}
-static void hkUnlock(void *,obs_hotkey_id,obs_hotkey_t *,bool pressed){if(pressed&&g_ui)g_ui->doControl("unlock");}
-static void hkToggle(void *,obs_hotkey_id,obs_hotkey_t *,bool pressed){if(pressed&&g_ui)g_ui->doControl("toggle");}
+void hotkeyClearMine(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    if (pressed) clearMyCanvas();
+}
+void hotkeyToggle(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    if (pressed) { g_visible = !g_visible; }
+}
+
+} // namespace
 
 extern "C" bool obs_module_load(void)
 {
-    g_canvas.fill(Qt::transparent);
-    g_localSourceInfo.id="vyanhq_draw_local";
-    g_localSourceInfo.type=OBS_SOURCE_TYPE_INPUT;
-    g_localSourceInfo.output_flags=OBS_SOURCE_VIDEO;
-    g_localSourceInfo.get_name=localSourceGetName;
-    g_localSourceInfo.create=localSourceCreate;
-    g_localSourceInfo.destroy=localSourceDestroy;
-    g_localSourceInfo.get_width=localSourceWidth;
-    g_localSourceInfo.get_height=localSourceHeight;
-    g_localSourceInfo.video_render=localSourceVideoRender;
-    obs_register_source(&g_localSourceInfo);
+    ensureDocument();
+    g_sourceInfo.id = "vyanhq_draw";
+    g_sourceInfo.type = OBS_SOURCE_TYPE_INPUT;
+    g_sourceInfo.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB;
+    g_sourceInfo.get_name = sourceGetName;
+    g_sourceInfo.create = sourceCreate;
+    g_sourceInfo.destroy = sourceDestroy;
+    g_sourceInfo.get_width = sourceWidth;
+    g_sourceInfo.get_height = sourceHeight;
+    g_sourceInfo.get_properties = sourceProperties;
+    g_sourceInfo.video_render = sourceVideoRender;
+    obs_register_source(&g_sourceInfo);
 
-    auto *mainWindow=static_cast<QMainWindow *>(obs_frontend_get_main_window());
-    g_dock=new QDockWidget(QStringLiteral("VyanHQ Draw"),mainWindow);
-    g_dock->setObjectName(QStringLiteral("VyanHQDrawDockCompactV18"));
-    g_dock->setAllowedAreas(Qt::LeftDockWidgetArea|Qt::RightDockWidgetArea|Qt::TopDockWidgetArea|Qt::BottomDockWidgetArea);
-    g_dock->resize(300,220);g_dock->setMinimumSize(170,140);
-    g_dock->setFeatures(QDockWidget::DockWidgetMovable|QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetClosable);
-    g_ui=new VyanDock(g_dock);g_dock->setWidget(g_ui);obs_frontend_add_dock_by_id("vyanhq-draw-dock-v18","VyanHQ Draw",g_dock);
+    auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+    g_dock = new QDockWidget(QStringLiteral("VyanHQ Draw"), mainWindow);
+    g_dock->setObjectName(QStringLiteral("VyanHQDrawDockV2"));
+    g_dock->setAllowedAreas(Qt::AllDockWidgetAreas);
+    g_dock->setMinimumSize(180, 150);
+    g_dock->resize(300, 220);
+    g_dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
+    g_ui = new VyanDock(g_dock);
+    g_dock->setWidget(g_ui);
+    obs_frontend_add_dock_by_id("vyanhq-draw-dock-v2", "VyanHQ Draw", g_dock);
 
-    g_clearMembers=obs_hotkey_register_frontend("vyanhq_draw_clear_members","VyanHQ Draw: Clear Member Drawings",hkClearMembers,nullptr);
-    g_clearMine=obs_hotkey_register_frontend("vyanhq_draw_clear_mine","VyanHQ Draw: Clear My Canvas",hkClearMine,nullptr);
-    g_lock=obs_hotkey_register_frontend("vyanhq_draw_lock","VyanHQ Draw: Lock Member Drawing",hkLock,nullptr);
-    g_unlock=obs_hotkey_register_frontend("vyanhq_draw_unlock","VyanHQ Draw: Unlock Member Drawing",hkUnlock,nullptr);
-    g_toggle=obs_hotkey_register_frontend("vyanhq_draw_toggle","VyanHQ Draw: Toggle Private Canvas",hkToggle,nullptr);
-    blog(LOG_INFO,"VyanHQ Draw loaded (v1.21)");
+    g_clearMine = obs_hotkey_register_frontend("vyanhq_draw_clear_mine_v2", "VyanHQ Draw: Clear My Canvas", hotkeyClearMine, nullptr);
+    g_toggleCanvas = obs_hotkey_register_frontend("vyanhq_draw_toggle_v2", "VyanHQ Draw: Toggle Canvas", hotkeyToggle, nullptr);
+
+    blog(LOG_INFO, "VyanHQ Draw v2 loaded");
     return true;
 }
 
 extern "C" void obs_module_unload(void)
 {
-    if(g_clearMembers!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_clearMembers);
-    if(g_clearMine!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_clearMine);
-    if(g_lock!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_lock);
-    if(g_unlock!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_unlock);
-    if(g_toggle!=OBS_INVALID_HOTKEY_ID)obs_hotkey_unregister(g_toggle);
-    if(g_localTexture){obs_enter_graphics();gs_texture_destroy(g_localTexture);g_localTexture=nullptr;obs_leave_graphics();}
-    if(g_dock)obs_frontend_remove_dock("vyanhq-draw-dock-v18");
-    g_ui=nullptr;g_dock=nullptr;
+    if (g_clearMine != OBS_INVALID_HOTKEY_ID) obs_hotkey_unregister(g_clearMine);
+    if (g_toggleCanvas != OBS_INVALID_HOTKEY_ID) obs_hotkey_unregister(g_toggleCanvas);
+    if (g_texture) {
+        obs_enter_graphics();
+        gs_texture_destroy(g_texture);
+        g_texture = nullptr;
+        obs_leave_graphics();
+    }
+    if (g_dock) obs_frontend_remove_dock("vyanhq-draw-dock-v2");
+    g_ui = nullptr;
+    g_dock = nullptr;
 }
 
 #include "plugin-main.moc"
