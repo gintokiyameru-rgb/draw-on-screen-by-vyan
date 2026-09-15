@@ -4,7 +4,7 @@ $path = Join-Path $env:GITHUB_WORKSPACE 'obs-template\src\plugin-main.cpp'
 if (-not (Test-Path $path)) { throw "plugin-main.cpp not found: $path" }
 
 $text = Get-Content $path -Raw
-$pattern = '(?s)static void sourceVideoRender\(void \*data, gs_effect_t \*effect\)\n\{.*?\n\}\n\nstatic obs_source_info g_sourceInfoInit\(\)'
+$pattern = '(?s)static void sourceVideoRender\(void \*data, gs_effect_t \*effect\)\r?\n\{.*?\r?\n\}\r?\n\r?\nstatic obs_source_info g_sourceInfoInit\(\)'
 $replacement = @'
 static void sourceVideoRender(void *data, gs_effect_t *effect)
 {
