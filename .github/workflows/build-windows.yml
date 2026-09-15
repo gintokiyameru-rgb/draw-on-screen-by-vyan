@@ -2,20 +2,18 @@ name: Build VyanHQ Draw for Windows x64
 
 on:
   workflow_dispatch:
-  push:
+  pull_request:
 
 jobs:
   build:
     runs-on: windows-2022
-
     steps:
       - name: Checkout VyanHQ Draw
         uses: actions/checkout@v5
 
       - name: Clone official OBS plugin template
         shell: pwsh
-        run: |
-          git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git obs-template
+        run: git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git obs-template
 
       - name: Copy VyanHQ files into template
         shell: pwsh
@@ -27,91 +25,54 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" "$env:GITHUB_WORKSPACE\obs-template\data\locale\en-US.ini" -Force
           Copy-Item "$env:GITHUB_WORKSPACE\data\locale\en-GB.ini" "$env:GITHUB_WORKSPACE\obs-template\data\locale\en-GB.ini" -Force
 
-      - name: Patch template for OBS 32.2.2 and VyanHQ
+      - name: Patch build environment for OBS 32.2.2
         shell: pwsh
         working-directory: obs-template
         run: |
           $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
           $spec.email = "vyanhq@example.invalid"
-
-          if (-not ($spec.PSObject.Properties.Name -contains 'platformConfig')) {
-            $spec | Add-Member -NotePropertyName platformConfig -NotePropertyValue ([pscustomobject]@{}) -Force
-          }
-          if (-not ($spec.platformConfig.PSObject.Properties.Name -contains 'macos')) {
-            $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{}) -Force
-          }
-          if (-not ($spec.platformConfig.macos.PSObject.Properties.Name -contains 'bundleId')) {
-            $spec.platformConfig.macos | Add-Member -NotePropertyName bundleId -NotePropertyValue "com.vyanhq.vyanhq-draw" -Force
-          } else {
-            $spec.platformConfig.macos.bundleId = "com.vyanhq.vyanhq-draw"
-          }
-
-          if (-not ($spec.PSObject.Properties.Name -contains 'dependencies')) {
-            throw "buildspec.json is missing the dependencies object."
-          }
-          if (-not ($spec.dependencies.PSObject.Properties.Name -contains 'obs-studio')) {
-            throw "buildspec.json is missing dependencies.obs-studio."
-          }
-
-          $obsUrl = "https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip"
+          if (-not ($spec.PSObject.Properties.Name -contains 'platformConfig')) { $spec | Add-Member -NotePropertyName platformConfig -NotePropertyValue ([pscustomobject]@{}) -Force }
+          if (-not ($spec.platformConfig.PSObject.Properties.Name -contains 'macos')) { $spec.platformConfig | Add-Member -NotePropertyName macos -NotePropertyValue ([pscustomobject]@{}) -Force }
+          if (-not ($spec.platformConfig.macos.PSObject.Properties.Name -contains 'bundleId')) { $spec.platformConfig.macos | Add-Member -NotePropertyName bundleId -NotePropertyValue "com.vyanhq.vyanhq-draw" -Force } else { $spec.platformConfig.macos.bundleId = "com.vyanhq.vyanhq-draw" }
           $obsZip = Join-Path $env:GITHUB_WORKSPACE "obs-32.2.2.zip"
-          Invoke-WebRequest -Uri $obsUrl -OutFile $obsZip
-          $obsHash = (Get-FileHash $obsZip -Algorithm SHA256).Hash.ToLowerInvariant()
-          $spec.dependencies.'obs-studio'.hashes.'windows-x64' = $obsHash
+          Invoke-WebRequest -Uri "https://github.com/obsproject/obs-studio/archive/refs/tags/32.2.2.zip" -OutFile $obsZip
+          $spec.dependencies.'obs-studio'.hashes.'windows-x64' = (Get-FileHash $obsZip -Algorithm SHA256).Hash.ToLowerInvariant()
           Remove-Item $obsZip -Force
           $spec | ConvertTo-Json -Depth 100 | Set-Content buildspec.json -Encoding UTF8
-
           $presets = Get-Content CMakePresets.json -Raw | ConvertFrom-Json
-
-          function Ensure-CacheVariables($node) {
+          function Fix-Node($node) {
             if ($null -eq $node) { return }
             $props = @($node.PSObject.Properties.Name)
             if ($props -contains 'cacheVariables') {
-              if ($null -eq $node.cacheVariables) {
-                $node | Add-Member -NotePropertyName cacheVariables -NotePropertyValue ([pscustomobject]@{}) -Force
-              }
+              if ($null -eq $node.cacheVariables) { $node | Add-Member -NotePropertyName cacheVariables -NotePropertyValue ([pscustomobject]@{}) -Force }
               $node.cacheVariables | Add-Member -NotePropertyName ENABLE_FRONTEND_API -NotePropertyValue 'ON' -Force
               $node.cacheVariables | Add-Member -NotePropertyName ENABLE_QT -NotePropertyValue 'ON' -Force
             }
-
-            if ($props -contains 'configurePresets') {
-              foreach ($p in @($node.configurePresets)) { Ensure-CacheVariables $p }
-            }
-            if ($props -contains 'buildPresets') {
-              foreach ($p in @($node.buildPresets)) { Ensure-CacheVariables $p }
-            }
+            if ($props -contains 'configurePresets') { foreach ($p in @($node.configurePresets)) { Fix-Node $p } }
+            if ($props -contains 'buildPresets') { foreach ($p in @($node.buildPresets)) { Fix-Node $p } }
           }
-
-          Ensure-CacheVariables $presets
+          Fix-Node $presets
           $presets | ConvertTo-Json -Depth 100 | Set-Content CMakePresets.json -Encoding UTF8
 
-          Write-Host "=== Patched buildspec ==="
-          Get-Content buildspec.json
-          Write-Host "=== Relevant CMake presets ==="
-          Get-Content CMakePresets.json | Select-String -Pattern 'windows-ci-x64|windows-x64|ENABLE_FRONTEND_API|ENABLE_QT' -Context 0,3
-
-      - name: Fix VyanHQ native source render path
+      - name: Fix native OBS compositor rendering
         shell: pwsh
-        run: |
-          ./scripts/fix-native-render.ps1
+        run: ./scripts/fix-native-render.ps1
 
-      - name: Build with official OBS Windows build script
+      - name: Build VyanHQ Draw
         shell: pwsh
         working-directory: obs-template
-        run: |
-          ./.github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+        run: ./.github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
 
-      - name: Package Windows plugin
+      - name: Package VyanHQ Draw
         shell: pwsh
         working-directory: obs-template
-        run: |
-          ./.github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+        run: ./.github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
 
-      - name: Upload build and release artifact
+      - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: VyanHQ-Draw-OBS-Windows-x64
+          name: VyanHQ-Draw-OBS-Windows-x64-render-fix
           path: |
             obs-template/release/**
             obs-template/build/**
