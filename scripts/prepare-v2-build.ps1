@@ -13,8 +13,9 @@ if ($text -notmatch 'obs_source_info g_sourceInfo') {
     $text = $text.Replace('VyanDock *g_ui = nullptr;', 'VyanDock *g_ui = nullptr;' + $newline + 'obs_source_info g_sourceInfo{};')
 }
 
-# Always replace early refresh calls with a helper because VyanDock is incomplete here.
-$text = [regex]::Replace($text, 'QMetaObject::invokeMethod\(g_ui,\s*"refreshCanvas",\s*Qt::QueuedConnection\);', 'requestUiRefresh();')
+# Early functions may only use the forward-declared VyanDock type.
+$text = [regex]::Replace($text, 'if\s*\(g_ui\)\s*(?:QMetaObject::invokeMethod\([^;]*refreshCanvas[^;]*\)|g_ui->refreshCanvas\(\))\s*;', 'requestUiRefresh();')
+$text = [regex]::Replace($text, 'QMetaObject::invokeMethod\(g_ui,[^;]*refreshCanvas[^;]*\);', 'requestUiRefresh();')
 if ($text -notmatch 'void requestUiRefresh\(\);') {
     $text = $text.Replace('void clearCanvasLocal()', 'void requestUiRefresh();' + $newline + $newline + 'void clearCanvasLocal()')
 }
@@ -27,14 +28,10 @@ $text = $text.Replace('connect(connectBtn, &QPushButton::clicked, dlg, [dlg, url
 $text = $text.Replace('            s.setValue("relay", url->text().trimmed());', '            QSettings settings("VyanHQ", "Draw");' + $newline + '            settings.setValue("relay", url->text().trimmed());')
 $text = $text.Replace('            s.setValue("room", room->text().trimmed());', '            settings.setValue("room", room->text().trimmed());')
 
-# QIODevice has no flush(); flush the concrete Qt socket types.
 $text = $text.Replace('        io()->flush();', '        if (m_socket) m_socket->flush(); else if (m_plain) m_plain->flush();')
-
-# obs_frontend_add_dock_by_id returns bool on OBS 32.2.2.
 $text = $text.Replace('QDockWidget *g_dock = nullptr;', 'bool g_dock = false;')
 $text = $text.Replace('    if (g_dock) g_dock = nullptr;', '    g_dock = false;')
 
-# Insert helper after the VyanDock class, immediately before source registration.
 if ($text -notmatch 'void requestUiRefresh\(\)\s*\{') {
     $marker = '};' + $newline + $newline + 'static const char *sourceGetName'
     $helper = '};' + $newline + $newline + 'void requestUiRefresh()' + $newline + '{' + $newline + '    if (g_ui) QTimer::singleShot(0, [ui = g_ui]() { ui->refreshCanvas(); });' + $newline + '}' + $newline + $newline + 'static const char *sourceGetName'
@@ -46,4 +43,4 @@ if ($text -notmatch 'void requestUiRefresh\(\)\s*\{') {
 }
 
 Set-Content -Path $path -Value $text -Encoding UTF8
-Write-Host 'Prepared VyanHQ v2 source with robust OBS 32.2.2 compile fixes.'
+Write-Host 'Prepared VyanHQ v2 source with comprehensive early UI-call fixes.'
