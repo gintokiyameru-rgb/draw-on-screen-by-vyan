@@ -310,24 +310,13 @@ static void sourceVideoRender(void *data, gs_effect_t *effect)
         g_textureRevision = revision;
     }
 
-    // Use the same native OBS effect pipeline used by synchronous sources.
-    // This avoids relying on the caller-provided effect and makes the source
-    // behave like a normal native transparent texture source.
-    gs_effect_t *drawEffect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-    if (!drawEffect)
-        return;
-
-    gs_eparam_t *imageParam = gs_effect_get_param_by_name(drawEffect, "image");
-    if (!imageParam)
-        return;
-
-    gs_effect_set_texture(imageParam, g_texture);
-
+    // OBS calls video_render with its graphics/effect state already active.
+    // Do not start a nested gs_effect_loop here; that produces
+    // "gs_effect_loop: An effect is already active" and results in a blank source.
+    // Let OBS handle the active effect and draw our texture through the helper.
     gs_blend_state_push();
     gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
-    while (gs_effect_loop(drawEffect, "Draw")) {
-        gs_draw_sprite(g_texture, 0, kCanvasW, kCanvasH);
-    }
+    obs_source_draw(g_texture, 0, kCanvasW, kCanvasH, false);
     gs_blend_state_pop();
 }
 
@@ -336,7 +325,7 @@ static obs_source_info g_sourceInfoInit()
     obs_source_info info{};
     info.id = "vyanhq_draw";
     info.type = OBS_SOURCE_TYPE_INPUT;
-    info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
+    info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB;
     info.get_name = sourceGetName;
     info.create = sourceCreate;
     info.destroy = sourceDestroy;
